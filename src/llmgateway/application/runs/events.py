@@ -1,0 +1,1 @@
+"""Application run events placeholder."""

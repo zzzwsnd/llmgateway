@@ -1,0 +1,1 @@
+"""Core exception types placeholder."""

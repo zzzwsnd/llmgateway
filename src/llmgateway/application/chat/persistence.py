@@ -1,0 +1,1 @@
+"""Chat persistence orchestration placeholder."""

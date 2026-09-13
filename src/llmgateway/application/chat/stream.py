@@ -1,0 +1,1 @@
+"""Streaming response orchestration placeholder."""
