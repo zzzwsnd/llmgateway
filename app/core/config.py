@@ -1,0 +1,5 @@
+APP_TITLE = "Agent LLM Gateway"
+APP_VERSION = "0.0.1"
+BACKUP_MODEL = "general-backup"
+MAX_ATTEMPTS_PER_MODEL = 2
+RETRY_DELAY_SECONDS = 0.1
