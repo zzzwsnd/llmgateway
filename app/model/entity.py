@@ -4,12 +4,17 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.model.enums import LLMProtocolEnum, ModelEnum, ModelProviderEnum
+
 
 @dataclass(frozen=True)
 class ModelConfig:
+    model: ModelEnum
+    provider: ModelProviderEnum
     provider_model: str
     base_url: str
     api_key_env: str
+    protocol: LLMProtocolEnum
     supports_structured_output: bool
     structured_output_mode: Literal["json_schema", "json_object"] = "json_schema"
 

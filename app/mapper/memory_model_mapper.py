@@ -1,53 +1,43 @@
-import os
-from collections.abc import Mapping
 from typing import Protocol
 
+from app.core.config import get_gateway_config
+from app.model.config import GatewayConfig
 from app.model.entity import ModelConfig, ModelPrice
+from app.model.enums import ModelEnum
 
 
 class ModelMapper(Protocol):
-    def find_config(self, model: str) -> ModelConfig | None: ...
+    def find_config(self, model: ModelEnum) -> ModelConfig | None: ...
 
-    def find_price(self, model: str) -> ModelPrice | None: ...
+    def find_price(self, model: ModelEnum) -> ModelPrice | None: ...
 
 
 class MemoryModelMapper:
-    def __init__(
-        self,
-        configs: Mapping[str, ModelConfig] | None = None,
-        prices: Mapping[str, ModelPrice] | None = None,
-    ) -> None:
-        self._configs = dict(configs) if configs is not None else self._default_configs()
-        self._prices = dict(prices) if prices is not None else self._default_prices()
+    def __init__(self, gateway_config: GatewayConfig | None = None) -> None:
+        config = gateway_config or get_gateway_config()
+        self._configs = {
+            model: ModelConfig(
+                model=model,
+                provider=route.provider,
+                provider_model=route.provider_model,
+                base_url=config.providers[route.provider].base_url,
+                api_key_env=config.providers[route.provider].api_key_env,
+                protocol=route.protocol,
+                supports_structured_output=route.capabilities.structured_output,
+                structured_output_mode=route.structured_output_mode,
+            )
+            for model, route in config.models.items()
+        }
+        self._prices = {
+            model: ModelPrice(
+                input_per_million=route.pricing.input_per_million,
+                output_per_million=route.pricing.output_per_million,
+            )
+            for model, route in config.models.items()
+        }
 
-    def find_config(self, model: str) -> ModelConfig | None:
+    def find_config(self, model: ModelEnum) -> ModelConfig | None:
         return self._configs.get(model)
 
-    def find_price(self, model: str) -> ModelPrice | None:
+    def find_price(self, model: ModelEnum) -> ModelPrice | None:
         return self._prices.get(model)
-
-    @staticmethod
-    def _default_configs() -> dict[str, ModelConfig]:
-        return {
-            "general-primary": ModelConfig(
-                provider_model=os.getenv("PRIMARY_PROVIDER_MODEL", "deepseek-v4-flash"),
-                base_url=os.getenv("PRIMARY_BASE_URL", "https://api.deepseek.com"),
-                api_key_env="DEEPSEEK_API_KEY",
-                supports_structured_output=True,
-                structured_output_mode="json_object",
-            ),
-            "general-backup": ModelConfig(
-                provider_model=os.getenv("BACKUP_PROVIDER_MODEL", "deepseek-chat"),
-                base_url=os.getenv("BACKUP_BASE_URL", "https://api.deepseek.com"),
-                api_key_env="DEEPSEEK_BACKUP_API_KEY",
-                supports_structured_output=True,
-                structured_output_mode="json_object",
-            ),
-        }
-
-    @staticmethod
-    def _default_prices() -> dict[str, ModelPrice]:
-        return {
-            "general-primary": ModelPrice(input_per_million=1.0, output_per_million=4.0),
-            "general-backup": ModelPrice(input_per_million=0.8, output_per_million=3.2),
-        }

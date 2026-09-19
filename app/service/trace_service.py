@@ -5,6 +5,7 @@ from app.core.logging import logger
 from app.dao.model_dao import ModelDao
 from app.dao.trace_dao import TraceDao
 from app.model.entity import CallTrace
+from app.model.enums import ModelEnum
 from app.model.request import PromptSelection
 from app.model.response import Usage
 
@@ -17,8 +18,8 @@ class TraceService:
     def record(
         self,
         request_id: str,
-        requested_model: str,
-        actual_model: str | None,
+        requested_model: ModelEnum,
+        actual_model: ModelEnum | None,
         prompt: PromptSelection | None,
         usage: Usage,
         latency_ms: int,
@@ -48,7 +49,7 @@ class TraceService:
     def list_traces(self) -> list[CallTrace]:
         return self._trace_dao.list_all()
 
-    def _calculate_cost(self, model: str | None, usage: Usage) -> float:
+    def _calculate_cost(self, model: ModelEnum | None, usage: Usage) -> float:
         if model is None:
             return 0
         price = self._model_dao.get_price(model)

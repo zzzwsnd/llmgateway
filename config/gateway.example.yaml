@@ -1,0 +1,86 @@
+app:
+  title: Agent LLM Gateway
+  version: 0.0.1
+
+retry:
+  max_retries_per_model: 3
+  initial_delay_seconds: 1
+  backoff_multiplier: 2
+
+json_parsing:
+  retry_prompt: |
+    你上一次返回的 JSON 未通过校验。
+
+    缺失参数：{missing_parameters}
+    错误参数：{invalid_parameters}
+    JSON 格式错误：{json_error}
+
+    请严格按照以下 JSON Schema 重新生成完整且合法的 JSON：
+    {schema}
+
+    只返回 JSON，不要输出 Markdown 代码块、解释或其他内容。
+
+sessions:
+  postgres_dsn_env: GATEWAY_POSTGRES_DSN
+  redis_url_env: GATEWAY_REDIS_URL
+  snowflake_worker_id_env: GATEWAY_SNOWFLAKE_WORKER_ID
+  max_active_sessions: 100
+  max_queued_sessions: 100
+  heartbeat_seconds: 5
+  event_ttl_seconds: 3600
+  event_block_milliseconds: 1000
+  startup_grace_seconds: 30
+  producer_lost_grace_seconds: 30
+  reconcile_interval_seconds: 10
+  shutdown_grace_seconds: 15
+
+providers:
+  deepseek:
+    base_url: https://api.deepseek.com
+    api_key_env: DEEPSEEK_API_KEY
+    supported_protocols: [chat_completions]
+  openai:
+    base_url: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY
+    supported_protocols: [chat_completions, responses]
+
+models:
+  general-primary:
+    provider: deepseek
+    provider_model: deepseek-v4-flash
+    protocol: chat_completions
+    structured_output_mode: json_object
+    fallback: general-backup
+    capabilities:
+      streaming: true
+      structured_output: true
+      tools: false
+      multimodal: false
+    pricing:
+      input_per_million: 1.0
+      output_per_million: 4.0
+  general-backup:
+    provider: deepseek
+    provider_model: deepseek-chat
+    protocol: chat_completions
+    structured_output_mode: json_object
+    capabilities:
+      streaming: true
+      structured_output: true
+      tools: false
+      multimodal: false
+    pricing:
+      input_per_million: 0.8
+      output_per_million: 3.2
+  general-responses:
+    provider: openai
+    provider_model: gpt-4.1-mini
+    protocol: responses
+    capabilities:
+      streaming: true
+      structured_output: true
+      tools: false
+      multimodal: false
+    pricing:
+      input_per_million: 0.4
+      output_per_million: 1.6

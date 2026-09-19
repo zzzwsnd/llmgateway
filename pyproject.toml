@@ -7,12 +7,15 @@ dependencies = [
     "jsonschema>=4.25,<5.0",
     "openai>=1.109,<3.0",
     "pydantic>=2.11,<3.0",
+    "psycopg[binary]>=3.2,<4.0",
+    "pyyaml>=6.0,<7.0",
+    "redis>=6.4,<8.0",
     "uvicorn[standard]>=0.35,<1.0",
 ]
 
 [dependency-groups]
 dev = [
-    "httpx2>=0.1,<1.0",
+    "httpx2>=2.0,<3.0",
     "pytest>=8.4,<10.0",
     "pytest-asyncio>=1.1,<2.0",
 ]

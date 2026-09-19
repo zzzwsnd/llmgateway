@@ -6,7 +6,7 @@
 
 **Architecture:** Controller 仅暴露 FastAPI 路由，Service 编排模型调用、Prompt、重试、降级和 Trace，DAO 封装数据操作，Mapper 执行内存或 OpenAI Compatible 的真实访问。Model 保存全部请求、响应、实体与 DTO，Core 提供配置、错误、异常处理、日志、工具和依赖装配。
 
-**Tech Stack:** Python 3.14、FastAPI、Pydantic 2、OpenAI Python SDK、jsonschema、pytest、pytest-asyncio、HTTPX、uv。
+**Tech Stack:** Python 3.14、FastAPI、Pydantic 2、OpenAI Python SDK、jsonschema、pytest、pytest-asyncio、httpx2（Starlette TestClient）、uv。
 
 **Spec:** `docs/superpowers/specs/2026-09-16-lightweight-mvc-refactor-design.md`
 
@@ -208,7 +208,7 @@ dependencies = [
 
 [dependency-groups]
 dev = [
-    "httpx>=0.28,<1.0",
+    "httpx2>=2.0,<3.0",
     "pytest>=8.4,<10.0",
     "pytest-asyncio>=1.1,<2.0",
 ]
@@ -554,7 +554,7 @@ class FakeProviderMapper:
 
 - [ ] **Step 2: Write failing non-stream orchestration tests**
 
-Cover these exact behaviors in separately named tests: successful provider result and Trace, one temporary retry on the same model, fallback after the second temporary failure, unknown-model 400 error, `use_stream_endpoint` error, invalid JSON, Schema mismatch, and `model_unavailable` Trace after both models fail. For the fallback case, use `[RetryableProviderError("one"), RetryableProviderError("two"), ProviderCompletion("ok", Usage(input_tokens=1, output_tokens=2))]` and assert `response.model == "general-backup"`, `response.attempts == 3`, and the saved Trace uses `actual_model == "general-backup"`.
+Cover these exact behaviors in separately named tests: successful provider result and Trace, one temporary retry on the same model, fallback after the second temporary failure, unknown-model 400 error, `use_stream_endpoint` error, invalid JSON, Schema mismatch, provider business errors, and `model_unavailable` Trace after both models fail. Structured-output and provider business errors must persist a failed Trace before the original `GatewayError` is re-raised. For the fallback case, use `[RetryableProviderError("one"), RetryableProviderError("two"), ProviderCompletion("ok", Usage(input_tokens=1, output_tokens=2))]` and assert `response.model == "general-backup"`, `response.attempts == 3`, and the saved Trace uses `actual_model == "general-backup"`.
 
 Assertions must inspect returned model, attempt count, provider call sequence, and saved Trace rather than implementation-private methods.
 
@@ -690,7 +690,7 @@ Expose `create_app(llm_service: LLMService | None = None, trace_service: TraceSe
 
 - [ ] **Step 5: Register global error handling and create the app**
 
-Implement a `GatewayError` handler returning the existing `detail` shape. `create_app()` sets the title/version, registers handlers, and includes both routers. Keep validation errors under FastAPI defaults.
+Implement a `GatewayError` handler returning the existing `detail` shape and an `Exception` fallback that logs the server-side exception while returning a non-sensitive `internal_server_error` response. `create_app()` sets the title/version, registers handlers, and includes both routers. Keep validation errors under FastAPI defaults.
 
 - [ ] **Step 6: Replace gateway.py with the compatibility export**
 

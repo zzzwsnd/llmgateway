@@ -3,6 +3,9 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 
+JsonValue = dict[str, Any] | list[Any] | str | int | float | bool | None
+
+
 class Usage(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -16,7 +19,7 @@ class LLMResponse(BaseModel):
     request_id: str
     model: str
     content: str
-    parsed: dict[str, Any] | list[Any] | None = None
+    parsed: JsonValue = None
     usage: Usage
     latency_ms: int = Field(ge=0)
     attempts: int = Field(ge=1)

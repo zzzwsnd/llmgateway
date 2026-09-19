@@ -1,29 +1,101 @@
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import Protocol
 
-from app.mapper.openai_mapper import ProviderMapper
-from app.model.dto import ProviderCompletion
-from app.model.entity import ModelConfig
-from app.model.request import Message
+from app.model.config import ModelRouteConfig, ProviderConfig
+from app.model.dto import ProviderCompletion, ProviderRequest
 
 
-class ProviderDao:
-    def __init__(self, mapper: ProviderMapper) -> None:
+class ProviderDao(Protocol):
+    async def complete(
+        self,
+        provider: ProviderConfig,
+        model: ModelRouteConfig,
+        request: ProviderRequest,
+    ) -> ProviderCompletion:
+        raise NotImplementedError
+
+    def stream(
+        self,
+        provider: ProviderConfig,
+        model: ModelRouteConfig,
+        request: ProviderRequest,
+    ) -> AsyncIterator[str]:
+        raise NotImplementedError
+
+
+class ChatCompletionsMapper(Protocol):
+    async def complete(
+        self,
+        provider: ProviderConfig,
+        model: ModelRouteConfig,
+        request: ProviderRequest,
+    ) -> ProviderCompletion:
+        raise NotImplementedError
+
+    def stream(
+        self,
+        provider: ProviderConfig,
+        model: ModelRouteConfig,
+        request: ProviderRequest,
+    ) -> AsyncIterator[str]:
+        raise NotImplementedError
+
+
+class ResponsesMapper(Protocol):
+    async def complete(
+        self,
+        provider: ProviderConfig,
+        model: ModelRouteConfig,
+        request: ProviderRequest,
+    ) -> ProviderCompletion:
+        raise NotImplementedError
+
+    def stream(
+        self,
+        provider: ProviderConfig,
+        model: ModelRouteConfig,
+        request: ProviderRequest,
+    ) -> AsyncIterator[str]:
+        raise NotImplementedError
+
+
+class ChatCompletionsDao:
+    def __init__(self, mapper: ChatCompletionsMapper) -> None:
         self._mapper = mapper
 
     async def complete(
         self,
-        config: ModelConfig,
-        messages: list[Message],
-        timeout_seconds: float,
-        response_schema: dict[str, Any] | None,
+        provider: ProviderConfig,
+        model: ModelRouteConfig,
+        request: ProviderRequest,
     ) -> ProviderCompletion:
-        return await self._mapper.complete(config, messages, timeout_seconds, response_schema)
+        return await self._mapper.complete(provider, model, request)
 
     def stream(
         self,
-        config: ModelConfig,
-        messages: list[Message],
-        timeout_seconds: float,
+        provider: ProviderConfig,
+        model: ModelRouteConfig,
+        request: ProviderRequest,
     ) -> AsyncIterator[str]:
-        return self._mapper.stream(config, messages, timeout_seconds)
+        return self._mapper.stream(provider, model, request)
+
+
+class ResponsesDao:
+    def __init__(self, mapper: ResponsesMapper) -> None:
+        self._mapper = mapper
+
+    async def complete(
+        self,
+        provider: ProviderConfig,
+        model: ModelRouteConfig,
+        request: ProviderRequest,
+    ) -> ProviderCompletion:
+        return await self._mapper.complete(provider, model, request)
+
+    def stream(
+        self,
+        provider: ProviderConfig,
+        model: ModelRouteConfig,
+        request: ProviderRequest,
+    ) -> AsyncIterator[str]:
+        return self._mapper.stream(provider, model, request)

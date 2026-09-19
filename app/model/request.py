@@ -2,6 +2,11 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from app.model.enums import ModelEnum
+
+
+StructuredOutputFormat = Literal["json_schema", "json_object"]
+
 
 class Message(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -21,10 +26,14 @@ class PromptSelection(BaseModel):
 class LLMRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    model: str = Field(min_length=1, max_length=100)
+    model: ModelEnum
     messages: list[Message] = Field(min_length=1, max_length=100)
     stream: bool = False
     response_schema: dict[str, Any] | None = None
+    response_schema_name: str | None = Field(default=None, min_length=1, max_length=64)
+    structured_output_format: StructuredOutputFormat | None = None
+    temperature: float | None = Field(default=None, ge=0, le=2)
+    max_output_tokens: int | None = Field(default=None, gt=0)
     timeout_seconds: float = Field(default=30, gt=0, le=120)
     prompt: PromptSelection | None = None
 
