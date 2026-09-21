@@ -27,6 +27,34 @@ class ModelPrice:
     output_per_million: float
 
 
+class Permission(BaseModel):
+    """A named capability that can be granted to a role."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    name: str = Field(min_length=1)
+    description: str | None = None
+
+
+class Role(BaseModel):
+    """A named collection of permission names."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    name: str = Field(min_length=1)
+    permissions: frozenset[str] = Field(default_factory=frozenset)
+
+
+class User(BaseModel):
+    """An identity associated with one or more role names."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    user_id: str = Field(min_length=1)
+    roles: frozenset[str] = Field(default_factory=frozenset)
+    is_active: bool = True
+
+
 class PromptTemplate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

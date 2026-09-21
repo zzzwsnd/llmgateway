@@ -32,3 +32,14 @@ class JsonOutputValidationError(ValueError):
 
 class InvalidJsonSchemaError(ValueError):
     """The caller supplied a document that is not a valid JSON Schema."""
+
+
+class PermissionDeniedError(PermissionError):
+    """Raised when a user does not have a requested permission."""
+
+    def __init__(self, user_id: str, permission_name: str) -> None:
+        self.user_id = user_id
+        self.permission_name = permission_name
+        super().__init__(
+            f"user '{user_id}' is not allowed to use permission '{permission_name}'"
+        )
