@@ -1,0 +1,113 @@
+name: Container
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: container-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.8"
+          enable-cache: true
+
+      - name: Install locked dependencies
+        run: uv sync --dev --locked
+
+      - name: Run tests
+        run: uv run --locked pytest -q
+
+      - name: Compile Python sources
+        run: uv run --locked python -m compileall -q app gateway.py tests
+
+  container:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GATEWAY_IMAGE: llmgateway:ci
+      GATEWAY_PULL_POLICY: never
+      POSTGRES_PASSWORD: ci-postgres-password
+      REDIS_PASSWORD: ci-redis-password
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build smoke-test image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: llmgateway:ci
+          platforms: linux/amd64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Start Compose topology
+        run: docker compose --env-file .env.compose.example up -d --no-build --wait --wait-timeout 120
+
+      - name: Smoke test model discovery
+        run: curl --fail --show-error --silent http://127.0.0.1:8000/v1/models
+
+      - name: Show Compose diagnostics
+        if: failure()
+        run: |
+          docker compose --env-file .env.compose.example ps
+          docker compose --env-file .env.compose.example logs --no-color
+
+      - name: Stop Compose topology
+        if: always()
+        run: docker compose --env-file .env.compose.example down --volumes --remove-orphans
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate image metadata
+        if: github.event_name != 'pull_request'
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/zzzwsnd/llmgateway
+          tags: |
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=sha,prefix=sha-,enable=${{ github.ref == 'refs/heads/main' }}
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+
+      - name: Publish image
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha

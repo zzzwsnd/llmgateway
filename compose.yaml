@@ -1,0 +1,75 @@
+name: llmgateway
+
+services:
+  gateway:
+    image: ${GATEWAY_IMAGE:-llmgateway:local}
+    pull_policy: ${GATEWAY_PULL_POLICY:-build}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 20s
+    environment:
+      GATEWAY_POSTGRES_HOST: postgres
+      GATEWAY_POSTGRES_PORT: "5432"
+      GATEWAY_POSTGRES_DBNAME: ${POSTGRES_DB:-llmgateway}
+      GATEWAY_POSTGRES_USER: ${POSTGRES_USER:-llmgateway}
+      GATEWAY_POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in the Compose environment file}
+      GATEWAY_REDIS_HOST: redis
+      GATEWAY_REDIS_PORT: "6379"
+      GATEWAY_REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD in the Compose environment file}
+      GATEWAY_REDIS_DATABASE: ${REDIS_DATABASE:-0}
+      GATEWAY_SNOWFLAKE_WORKER_ID: "0"
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    ports:
+      - "${GATEWAY_PORT:-8000}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/v1/models', timeout=2).close()"
+      interval: 10s
+      timeout: 3s
+      start_period: 10s
+      retries: 6
+
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-llmgateway}
+      POSTGRES_USER: ${POSTGRES_USER:-llmgateway}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in the Compose environment file}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD in the Compose environment file}
+    command: ["sh", "-c", "exec redis-server --appendonly yes --requirepass \"$$REDIS_PASSWORD\""]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$${REDIS_PASSWORD}\" redis-cli ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  postgres_data:
+  redis_data:
