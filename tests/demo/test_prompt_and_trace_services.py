@@ -7,16 +7,24 @@ from app.dao.trace_dao import TraceDao
 from app.mapper.memory_model_mapper import MemoryModelMapper
 from app.mapper.memory_prompt_mapper import MemoryPromptMapper
 from app.mapper.memory_trace_mapper import MemoryTraceMapper
+from app.model.entity import AttemptStatus, AttemptType
 from app.model.request import LLMRequest, Message, PromptSelection
 from app.model.response import Usage
 from app.service.prompt_service import PromptService
 from app.service.trace_service import TraceService
 
 
-def build_trace_service() -> TraceService:
+class NoFullScanTraceMapper(MemoryTraceMapper):
+    async def find_all(self):
+        raise AssertionError("call finalization must not scan all traces")
+
+
+def build_trace_service(
+    mapper: MemoryTraceMapper | None = None,
+) -> TraceService:
     return TraceService(
         model_dao=ModelDao(MemoryModelMapper()),
-        trace_dao=TraceDao(MemoryTraceMapper()),
+        trace_dao=TraceDao(mapper or MemoryTraceMapper()),
     )
 
 
@@ -74,20 +82,46 @@ def test_prompt_service_prepends_system_message_without_mutating_request() -> No
     assert request.messages == [original_message]
 
 
-def test_trace_service_calculates_cost_and_persists_trace() -> None:
+@pytest.mark.asyncio
+async def test_trace_service_calculates_cost_and_persists_trace() -> None:
     service = build_trace_service()
 
-    trace = service.record(
-        request_id="request-1",
+    await service.start_call(
+        call_id="request-1",
         requested_model="general-primary",
-        actual_model="general-primary",
         prompt=None,
+    )
+    running = await service.list_traces()
+    attempt = await service.start_attempt(
+        call_id="request-1",
+        model="general-primary",
+        prompt=None,
+        attempt_type=AttemptType.INITIAL,
+        json_requested=False,
+    )
+    await service.finish_attempt(
+        attempt,
+        status=AttemptStatus.SUCCESS,
         usage=Usage(input_tokens=1_000_000, output_tokens=1_000_000),
         latency_ms=10,
-        attempts=1,
-        status="success",
     )
+    trace = await service.finish_call("request-1", status="success")
 
     assert trace.cost_usd == 5.0
     assert trace.timestamp.tzinfo is not None
-    assert service.list_traces() == [trace]
+    assert running[0].status == "running"
+    assert await service.list_traces() == [trace]
+
+
+@pytest.mark.asyncio
+async def test_trace_finalization_reads_only_the_completed_call() -> None:
+    service = build_trace_service(NoFullScanTraceMapper())
+    await service.start_call(
+        call_id="request-1",
+        requested_model="general-primary",
+        prompt=None,
+    )
+
+    trace = await service.finish_call("request-1", status="success")
+
+    assert trace.request_id == "request-1"
