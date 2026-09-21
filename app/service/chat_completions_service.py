@@ -17,6 +17,7 @@ from app.model.chat_completions import (
 )
 from app.model.enums import LLMProtocolEnum
 from app.model.request import LLMRequest
+from app.model.session import SessionInterface
 from app.service.llm_service import LLMService
 
 
@@ -28,6 +29,7 @@ class ChatCompletionsService:
         response = await self._llm_service.complete(
             self.to_llm_request(request),
             required_protocol=LLMProtocolEnum.CHAT_COMPLETIONS,
+            interface=SessionInterface.CHAT_COMPLETIONS,
         )
         return ChatCompletionResponse(
             id=f"chatcmpl-{uuid4().hex}",
@@ -49,6 +51,7 @@ class ChatCompletionsService:
         events = self._llm_service.stream_events(
             self.to_llm_request(request),
             required_protocol=LLMProtocolEnum.CHAT_COMPLETIONS,
+            interface=SessionInterface.CHAT_COMPLETIONS,
         )
         return self._stream(events, request.model)
 

@@ -6,6 +6,7 @@ import os
 import time
 from typing import Protocol
 
+from app.model.config import RedisConnectionConfig
 from app.model.session import RuntimeEvent
 
 
@@ -117,11 +118,11 @@ class MemoryRuntimeMapper:
 class RedisRuntimeMapper:
     def __init__(
         self,
-        redis_url_env: str,
+        config: RedisConnectionConfig,
         key_prefix: str = "gateway",
         event_ttl_seconds: int = 3600,
     ) -> None:
-        self._redis_url_env = redis_url_env
+        self._config = config
         self._prefix = key_prefix.rstrip(":")
         self._event_ttl_seconds = max(event_ttl_seconds, 86400)
         self._client_instance = None
@@ -179,10 +180,28 @@ class RedisRuntimeMapper:
         if self._client_instance is None:
             from redis.asyncio import Redis
 
-            url = os.getenv(self._redis_url_env)
-            if not url:
-                raise RuntimeError("Redis session runtime is not configured")
-            self._client_instance = Redis.from_url(url, decode_responses=True)
+            self._client_instance = Redis(
+                host=_required_environment(
+                    self._config.host_env,
+                    "Redis session runtime is not configured",
+                ),
+                port=_required_environment_int(
+                    self._config.port_env,
+                    "Redis port must be an integer between 1 and 65535",
+                    minimum=1,
+                    maximum=65535,
+                ),
+                password=_required_environment(
+                    self._config.password_env,
+                    "Redis session runtime is not configured",
+                ),
+                db=_required_environment_int(
+                    self._config.database_env,
+                    "Redis database must be a non-negative integer",
+                    minimum=0,
+                ),
+                decode_responses=True,
+            )
         return self._client_instance
 
     def _events_key(self, session_id: str) -> str:
@@ -196,3 +215,27 @@ class RedisRuntimeMapper:
         data = json.loads(raw)
         data["event_id"] = event_id
         return RuntimeEvent.model_validate(data)
+
+
+def _required_environment(name: str, error_message: str) -> str:
+    value = os.getenv(name)
+    if not value:
+        raise RuntimeError(error_message)
+    return value
+
+
+def _required_environment_int(
+    name: str,
+    error_message: str,
+    *,
+    minimum: int,
+    maximum: int | None = None,
+) -> int:
+    raw_value = _required_environment(name, error_message)
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise RuntimeError(error_message) from exc
+    if value < minimum or maximum is not None and value > maximum:
+        raise RuntimeError(error_message)
+    return value

@@ -71,6 +71,15 @@ class StreamSessionService:
         request, required = self._prepare_request(body)
         self._llm.validate_stream_request(request, required)
         fingerprint = self._fingerprint(body)
+        retry_of_call_id = body.retry_of_call_id
+        if retry_of_call_id is not None:
+            await self._validate_expired_retry(
+                retry_of_call_id,
+                fingerprint=fingerprint,
+                interface=body.interface,
+                idempotency_key=idempotency_key,
+                actor_id=actor_id,
+            )
         if idempotency_key is not None:
             try:
                 existing = await self._sessions.get_by_idempotency(idempotency_key)
@@ -89,8 +98,11 @@ class StreamSessionService:
         session = StreamSession(
             session_id=format_session_id(self._ids.next_id()), interface=body.interface,
             requested_model=body.request.model, status=SessionStatus.PENDING,
-            generation_id=str(uuid4()), request_fingerprint=fingerprint,
+            request_fingerprint=fingerprint,
             idempotency_key=idempotency_key, owner_id=actor_id,
+            retry_of_call_id=retry_of_call_id,
+            prompt_name=request.prompt.name if request.prompt else None,
+            prompt_version=request.prompt.version if request.prompt else None,
             created_at=now, updated_at=now,
         )
         self._access.assert_allowed(actor_id, session, SessionAction.CREATE)
@@ -107,7 +119,7 @@ class StreamSessionService:
             await self._fail_pending(stored, "session_capacity_exceeded")
             raise GatewayError("session_capacity_exceeded", "Session capacity is exhausted", 503)
         self._start_background(
-            self._heartbeat_loop(stored.session_id, stored.generation_id),
+            self._heartbeat_loop(stored.session_id),
             f"session-activity-{stored.session_id}",
         )
         return self._create_response(stored)
@@ -116,13 +128,15 @@ class StreamSessionService:
         session = await self._get_required(session_id)
         self._access.assert_allowed(actor_id, session, SessionAction.READ)
         try:
-            replay_available = await asyncio.wait_for(self._runtime.has_events(session_id), timeout=1)
+            replay_available = await asyncio.wait_for(
+                self._runtime.has_public_events(session_id), timeout=1
+            )
         except Exception:
             replay_available = False
         return StreamSessionResponse(
             session_id=session.session_id, interface=session.interface,
             model=session.requested_model, status=session.status,
-            result_text=session.result_text, error_code=session.error_code,
+            result_text=None, error_code=session.error_code,
             replay_degraded=session.replay_degraded, replay_available=replay_available,
             active_connections=None,
             producer_health="unknown", created_at=session.created_at,
@@ -153,8 +167,62 @@ class StreamSessionService:
 
     @staticmethod
     def _fingerprint(body) -> str:
-        raw = json.dumps(body.model_dump(mode="json"), sort_keys=True, separators=(",", ":")).encode()
+        raw = json.dumps(
+            body.model_dump(mode="json", exclude={"retry_of_call_id"}),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
         return hashlib.sha256(raw).hexdigest()
+
+    async def _validate_expired_retry(
+        self,
+        retry_of_call_id: str,
+        *,
+        fingerprint: str,
+        interface: SessionInterface,
+        idempotency_key: str | None,
+        actor_id: str | None,
+    ) -> None:
+        original = await self._get_required(retry_of_call_id)
+        self._access.assert_allowed(actor_id, original, SessionAction.READ)
+        if original.owner_id != actor_id:
+            raise GatewayError(
+                "retry_request_mismatch",
+                "The retry does not match the expired stream call",
+                409,
+            )
+        if idempotency_key is None or idempotency_key == original.idempotency_key:
+            raise GatewayError(
+                "retry_requires_new_idempotency_key",
+                "An expired stream retry requires a new Idempotency-Key",
+                409,
+            )
+        if (
+            not original.status.is_terminal
+            or original.interface is not interface
+            or original.request_fingerprint != fingerprint
+        ):
+            raise GatewayError(
+                "retry_request_mismatch",
+                "The retry does not match the expired stream call",
+                409,
+            )
+        try:
+            replay_available = await asyncio.wait_for(
+                self._runtime.has_public_events(retry_of_call_id), timeout=1
+            )
+        except Exception as exc:
+            raise GatewayError(
+                "session_runtime_unavailable",
+                "Session runtime is unavailable",
+                503,
+            ) from exc
+        if replay_available and not original.replay_degraded:
+            raise GatewayError(
+                "stream_not_expired",
+                "The original stream is still available",
+                409,
+            )
 
     @staticmethod
     def _create_response(session: StreamSession) -> CreateStreamSessionResponse:
@@ -165,6 +233,23 @@ class StreamSessionService:
         self._validate_cursor(after)
         session = await self._get_required(session_id)
         self._access.assert_allowed(actor_id, session, SessionAction.SUBSCRIBE)
+        if session.status.is_terminal:
+            try:
+                replay_available = await asyncio.wait_for(
+                    self._runtime.has_public_events(session_id, after=after), timeout=1
+                )
+            except Exception as exc:
+                raise GatewayError(
+                    "session_runtime_unavailable",
+                    "Session runtime is unavailable",
+                    503,
+                ) from exc
+            if not replay_available or session.replay_degraded:
+                raise GatewayError(
+                    "stream_expired",
+                    f"Stream events expired for call {session_id}",
+                    410,
+                )
         connection = _connection or SessionConnection(connection_id=str(uuid4()), session_id=session_id, connected_at=datetime.now(timezone.utc))
         cursor = after
         try:
@@ -184,8 +269,7 @@ class StreamSessionService:
             for control in controls:
                 control_cursor = control.event_id
                 if (
-                    control.generation_id == session.generation_id
-                    and control.type is RuntimeEventType.CONTROL_DETACH
+                    control.type is RuntimeEventType.CONTROL_DETACH
                     and control.connection_id == connection.connection_id
                 ):
                     return
@@ -199,8 +283,6 @@ class StreamSessionService:
                 events, runtime_failed = [], True
             for event in events:
                 cursor = event.event_id
-                if event.generation_id != session.generation_id:
-                    continue
                 if event.type is RuntimeEventType.CONTROL_DETACH:
                     if event.connection_id == connection.connection_id:
                         return
@@ -214,8 +296,6 @@ class StreamSessionService:
                 current = await self._get_required(session_id)
                 if not current.status.is_terminal:
                     continue
-                if current.result_text is not None:
-                    yield self._event(SessionEventType.SNAPSHOT, {"content": current.result_text})
                 yield public
                 return
             session = await self._get_required(session_id)
@@ -223,8 +303,6 @@ class StreamSessionService:
             if events:
                 continue
             if session.status.is_terminal:
-                if session.result_text is not None:
-                    yield self._event(SessionEventType.SNAPSHOT, {"content": session.result_text})
                 yield self._terminal_event(session)
                 return
             yield self._event(SessionEventType.HEARTBEAT, {})
@@ -248,7 +326,7 @@ class StreamSessionService:
         self._access.assert_allowed(actor_id, session, SessionAction.DETACH)
         try:
             await asyncio.wait_for(
-                self._runtime.append_control(session_id, event_type=RuntimeEventType.CONTROL_DETACH, generation_id=session.generation_id, connection_id=connection_id),
+                self._runtime.append_control(session_id, event_type=RuntimeEventType.CONTROL_DETACH, connection_id=connection_id),
                 timeout=1,
             )
         except Exception as exc:
@@ -265,8 +343,8 @@ class StreamSessionService:
                 break
             try:
                 cancelling = await self._sessions.transition(
-                    session_id, generation_id=session.generation_id,
-                    expected_statuses={session.status}, expected_version=session.version,
+                    session_id,
+                    expected_statuses={session.status},
                     target_status=SessionStatus.CANCELLING,
                 )
             except Exception as exc:
@@ -276,7 +354,7 @@ class StreamSessionService:
         runtime_error = None
         try:
             await asyncio.wait_for(
-                self._runtime.append_control(session_id, event_type=RuntimeEventType.CONTROL_CANCEL, generation_id=session.generation_id),
+                self._runtime.append_control(session_id, event_type=RuntimeEventType.CONTROL_CANCEL),
                 timeout=1,
             )
         except Exception as exc:
@@ -300,24 +378,25 @@ class StreamSessionService:
         for session in sessions:
             if self._supervisor.owns(session.session_id):
                 continue
-            grace = self._config.startup_grace_seconds if session.status is SessionStatus.PENDING else self._config.producer_lost_grace_seconds
-            if (now - session.updated_at).total_seconds() < grace:
+            grace = (
+                self._config.startup_grace_seconds
+                if session.status is SessionStatus.PENDING
+                else self._config.producer_lost_grace_seconds
+            )
+            session_cutoff = now - timedelta(seconds=grace)
+            if session.updated_at > session_cutoff:
                 continue
-            target = SessionStatus.CANCELLED if session.status is SessionStatus.CANCELLING else SessionStatus.FAILED
-            error_code = "session_start_timeout" if session.status is SessionStatus.PENDING else "producer_lost"
-            # Never retry against a refreshed version: activity must fence this scan.
             try:
-                terminal = await self._sessions.transition(
-                    session.session_id, generation_id=session.generation_id,
-                    expected_statuses={session.status}, expected_version=session.version,
-                    target_status=target, error_code=None if target is SessionStatus.CANCELLED else error_code,
+                terminal = await self._sessions.reconcile(
+                    session.session_id,
+                    updated_before=session_cutoff,
                 )
             except Exception:
                 logger.warning("Failed to reconcile session %s", session.session_id)
                 continue
             if terminal is not None:
                 await self._publish_terminal(terminal)
-                if target is SessionStatus.CANCELLED:
+                if terminal.status is SessionStatus.CANCELLED:
                     await self._compensate(terminal)
 
     async def _reconcile_loop(self) -> None:
@@ -335,19 +414,23 @@ class StreamSessionService:
         running = await self._transition_retry(session, SessionStatus.RUNNING)
         if running is None:
             return
-        content: list[str] = []
         first_content_ms = upstream_first_ms = None
         replay_degraded = False
 
         async def consume() -> None:
             nonlocal first_content_ms, upstream_first_ms, replay_degraded
-            async with aclosing(self._llm.stream_events(request, required_protocol)) as stream:
+            async with aclosing(
+                self._llm.stream_events(
+                    request,
+                    required_protocol,
+                    existing_call_id=session_id,
+                )
+            ) as stream:
                 async for event in stream:
                     current = await self._get_required(session_id)
-                    if current.status is not SessionStatus.RUNNING or current.generation_id != running.generation_id:
+                    if current.status is not SessionStatus.RUNNING:
                         raise asyncio.CancelledError
                     if event.type == "text_delta" and event.delta:
-                        content.append(event.delta)
                         if upstream_first_ms is None:
                             upstream_first_ms = event.upstream_first_delta_latency_ms
                         published = await self._append_runtime(current, RuntimeEventType.DELTA, {"delta": event.delta})
@@ -355,14 +438,6 @@ class StreamSessionService:
                             replay_degraded = True
                         elif first_content_ms is None:
                             first_content_ms = max(0, int((datetime.now(timezone.utc) - session.created_at).total_seconds() * 1000))
-                        try:
-                            await self._sessions.record_metrics(
-                                session_id, generation_id=running.generation_id,
-                                upstream_first_delta_latency_ms=upstream_first_ms,
-                                first_content_latency_ms=first_content_ms,
-                            )
-                        except Exception:
-                            logger.warning("Failed to record stream metrics for %s", session_id)
                     elif event.type == "failed":
                         raise GatewayError(event.error_code or "upstream_stream_failed", "Upstream provider failed", 502)
                     elif event.type == "completed":
@@ -383,7 +458,7 @@ class StreamSessionService:
             controls.cancel()
             await asyncio.gather(controls, return_exceptions=True)
         await self._finish(
-            running, target, result_text="".join(content), error_code=error_code,
+            running, target, error_code=error_code,
             replay_degraded=replay_degraded, upstream_first_delta_latency_ms=upstream_first_ms,
             first_content_latency_ms=first_content_ms,
         )
@@ -398,32 +473,32 @@ class StreamSessionService:
                 )
                 for event in events:
                     cursor = event.event_id
-                    if event.generation_id == session.generation_id and event.type is RuntimeEventType.CONTROL_CANCEL:
+                    if event.type is RuntimeEventType.CONTROL_CANCEL:
                         provider.cancel()
                         return
             except Exception:
                 await asyncio.sleep(self._config.heartbeat_seconds)
             try:
                 current = await self._sessions.get(session.session_id)
-                if current is None or current.generation_id != session.generation_id or current.status is not SessionStatus.RUNNING:
+                if current is None or current.status is not SessionStatus.RUNNING:
                     provider.cancel()
                     return
             except Exception:
                 logger.warning("Failed to check cancellation state for %s", session.session_id)
 
-    async def _heartbeat_loop(self, session_id: str, generation_id: str) -> None:
+    async def _heartbeat_loop(self, session_id: str) -> None:
         while self._supervisor.owns(session_id):
             await asyncio.sleep(self._config.heartbeat_seconds)
             try:
                 current = await self._get_required(session_id)
-                if current.generation_id != generation_id or current.status.is_terminal:
+                if current.status.is_terminal:
                     await self._supervisor.cancel_queued(session_id)
                     return
                 if current.status is SessionStatus.CANCELLING:
                     if await self._supervisor.cancel_queued(session_id):
                         await self._finish_cancel(current)
                         return
-                if not await self._sessions.heartbeat(session_id, generation_id=generation_id):
+                if not await self._sessions.heartbeat(session_id):
                     return
             except asyncio.CancelledError:
                 raise
@@ -441,7 +516,7 @@ class StreamSessionService:
     async def _append_runtime(self, session: StreamSession, event_type: RuntimeEventType, data: dict) -> RuntimeEvent | None:
         try:
             return await asyncio.wait_for(
-                self._runtime.append_event(session.session_id, RuntimeEvent(type=event_type, generation_id=session.generation_id, data=data, created_at=datetime.now(timezone.utc))),
+                self._runtime.append_event(session.session_id, RuntimeEvent(type=event_type, data=data, created_at=datetime.now(timezone.utc))),
                 timeout=1,
             )
         except Exception:
@@ -469,11 +544,11 @@ class StreamSessionService:
             if self._stopping and shutdown_deadline is None:
                 shutdown_deadline = time.monotonic() + self._config.shutdown_grace_seconds
             try:
-                result = await self._sessions.transition(current.session_id, generation_id=current.generation_id, expected_statuses={current.status}, expected_version=current.version, target_status=target, **kwargs)
+                result = await self._sessions.transition(current.session_id, expected_statuses={current.status}, target_status=target, **kwargs)
                 if result is not None:
                     return result
                 latest = await self._sessions.get(current.session_id)
-                if latest is None or latest.generation_id != session.generation_id or latest.status not in allowed:
+                if latest is None or latest.status not in allowed:
                     return None
                 current = latest
                 if shutdown_deadline is not None and time.monotonic() >= shutdown_deadline:
@@ -500,7 +575,7 @@ class StreamSessionService:
                     return
                 await asyncio.sleep(self._config.heartbeat_seconds)
                 continue
-            if current is None or current.status.is_terminal or current.generation_id != session.generation_id:
+            if current is None or current.status.is_terminal:
                 return
             if current.status is SessionStatus.CANCELLING:
                 await self._finish_cancel(current, **kwargs)

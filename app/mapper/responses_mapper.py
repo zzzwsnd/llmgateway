@@ -7,7 +7,7 @@ from app.core.config import resolve_api_key
 from app.core.errors import RetryableProviderError
 from app.mapper.openai_mapper import close_provider_stream, raise_retryable_provider_error
 from app.model.config import ModelRouteConfig, ProviderConfig
-from app.model.dto import ProviderCompletion, ProviderRequest
+from app.model.dto import ProviderCompletion, ProviderRequest, ProviderStreamChunk
 from app.model.response import Usage
 
 
@@ -34,7 +34,7 @@ class ResponsesMapper:
 
     async def stream(
         self, provider: ProviderConfig, model: ModelRouteConfig, request: ProviderRequest
-    ) -> AsyncIterator[str]:
+    ) -> AsyncIterator[ProviderStreamChunk]:
         response = None
         try:
             response = await self._create_client(provider).responses.create(
@@ -42,8 +42,29 @@ class ResponsesMapper:
             )
             async for event in response:
                 if event.type == "response.output_text.delta" and event.delta:
-                    yield event.delta
+                    yield ProviderStreamChunk(delta=event.delta)
+                elif event.type == "response.completed":
+                    raw_usage = getattr(
+                        getattr(event, "response", None), "usage", None
+                    )
+                    if raw_usage is not None:
+                        yield ProviderStreamChunk(
+                            usage=Usage(
+                                input_tokens=raw_usage.input_tokens,
+                                output_tokens=raw_usage.output_tokens,
+                            )
+                        )
                 elif event.type in {"response.failed", "response.incomplete"}:
+                    raw_usage = getattr(
+                        getattr(event, "response", None), "usage", None
+                    )
+                    if raw_usage is not None:
+                        yield ProviderStreamChunk(
+                            usage=Usage(
+                                input_tokens=raw_usage.input_tokens,
+                                output_tokens=raw_usage.output_tokens,
+                            )
+                        )
                     raise RetryableProviderError(
                         "Upstream Responses request did not complete"
                     )

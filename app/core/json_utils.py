@@ -19,7 +19,7 @@ _CLOSING_BRACKET = {"{": "}", "[": "]"}
 
 class JsonOutputParser:
     def __init__(self, config: JsonParsingConfig) -> None:
-        self._retry_prompt = config.retry_prompt
+        self._retry_prompt = config.retry_prompt.active.template
 
     def parse(self, content: str, schema: dict[str, Any]) -> JsonParseResult:
         normalized_content = content

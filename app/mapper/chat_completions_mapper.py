@@ -7,7 +7,7 @@ from openai import AsyncOpenAI
 from app.core.config import resolve_api_key
 from app.mapper.openai_mapper import close_provider_stream, raise_retryable_provider_error
 from app.model.config import ModelRouteConfig, ProviderConfig
-from app.model.dto import ProviderCompletion, ProviderRequest
+from app.model.dto import ProviderCompletion, ProviderRequest, ProviderStreamChunk
 from app.model.response import Usage
 
 
@@ -33,7 +33,7 @@ class ChatCompletionsMapper:
 
     async def stream(
         self, provider: ProviderConfig, model: ModelRouteConfig, request: ProviderRequest
-    ) -> AsyncIterator[str]:
+    ) -> AsyncIterator[ProviderStreamChunk]:
         response = None
         try:
             response = await self._create_client(provider).chat.completions.create(
@@ -41,8 +41,18 @@ class ChatCompletionsMapper:
             )
             async for chunk in response:
                 choice = chunk.choices[0] if chunk.choices else None
-                if choice and choice.delta.content:
-                    yield choice.delta.content
+                delta = choice.delta.content if choice else None
+                raw_usage = getattr(chunk, "usage", None)
+                usage = (
+                    Usage(
+                        input_tokens=raw_usage.prompt_tokens,
+                        output_tokens=raw_usage.completion_tokens,
+                    )
+                    if raw_usage is not None
+                    else None
+                )
+                if delta or usage is not None:
+                    yield ProviderStreamChunk(delta=delta, usage=usage)
         except Exception as exc:
             raise_retryable_provider_error(exc)
         finally:
@@ -64,6 +74,7 @@ class ChatCompletionsMapper:
         }
         if stream:
             data["stream"] = True
+            data["stream_options"] = {"include_usage": True}
         if request.temperature is not None:
             data["temperature"] = request.temperature
         if request.max_output_tokens is not None:
