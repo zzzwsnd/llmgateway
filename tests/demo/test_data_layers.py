@@ -1,5 +1,7 @@
 from datetime import datetime, timezone
 
+import pytest
+
 from app.core.config import load_gateway_config
 from app.dao.model_dao import ModelDao
 from app.dao.prompt_dao import PromptDao
@@ -7,8 +9,15 @@ from app.dao.trace_dao import TraceDao
 from app.mapper.memory_model_mapper import MemoryModelMapper
 from app.mapper.memory_prompt_mapper import MemoryPromptMapper
 from app.mapper.memory_trace_mapper import MemoryTraceMapper
+from app.mapper.call_schema import CALL_SCHEMA_STATEMENTS
 from app.model.enums import ModelEnum
-from app.model.entity import CallTrace
+from app.model.entity import (
+    AttemptStatus,
+    AttemptType,
+    CallAttempt,
+    CallRecord,
+    JsonValidationStatus,
+)
 
 
 def test_model_mapper_exposes_models_from_gateway_config() -> None:
@@ -30,22 +39,62 @@ def test_default_prompt_mapper_returns_versioned_template() -> None:
     assert "${product_name}" in template.system_template
 
 
-def test_trace_mapper_returns_a_snapshot() -> None:
-    dao = TraceDao(MemoryTraceMapper())
-    trace = CallTrace(
-        request_id="request-1",
-        timestamp=datetime.now(timezone.utc),
-        requested_model="general-primary",
-        input_tokens=1,
-        output_tokens=2,
-        cost_usd=0.0,
-        latency_ms=3,
-        attempts=1,
-        status="success",
-    )
-    dao.save(trace)
+def test_call_attempt_schema_persists_only_prompt_identity_and_sha256() -> None:
+    ddl = "\n".join(CALL_SCHEMA_STATEMENTS)
 
-    snapshot = dao.list_all()
+    assert "prompt_sha256 TEXT" in ddl
+    assert "ADD COLUMN IF NOT EXISTS prompt_sha256" in ddl
+    assert "prompt_body" not in ddl
+    assert "prompt_template" not in ddl
+
+
+@pytest.mark.asyncio
+async def test_trace_mapper_returns_a_snapshot() -> None:
+    dao = TraceDao(MemoryTraceMapper())
+    now = datetime.now(timezone.utc)
+    call = CallRecord(
+        call_id="request-1",
+        requested_model="general-primary",
+        status="success",
+        created_at=now,
+        updated_at=now,
+        started_at=now,
+        finished_at=now,
+    )
+    await dao.create_call(call)
+
+    snapshot = await dao.list_all()
     snapshot.clear()
 
-    assert dao.list_all() == [trace]
+    stored = await dao.list_all()
+    assert len(stored) == 1
+    assert stored[0].request_id == call.call_id
+
+
+@pytest.mark.asyncio
+async def test_trace_mapper_rejects_attempt_until_call_is_running() -> None:
+    mapper = MemoryTraceMapper()
+    now = datetime.now(timezone.utc)
+    await mapper.insert_call(
+        CallRecord(
+            call_id="call-pending",
+            requested_model="general-primary",
+            status="pending",
+            created_at=now,
+            updated_at=now,
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="call is running"):
+        await mapper.insert_attempt(
+            CallAttempt(
+                attempt_id="attempt-1",
+                call_id="call-pending",
+                attempt_no=0,
+                attempt_type=AttemptType.INITIAL,
+                model="general-primary",
+                status=AttemptStatus.RUNNING,
+                json_validation_status=JsonValidationStatus.NOT_REQUESTED,
+                started_at=now,
+            )
+        )

@@ -65,6 +65,7 @@ class CreateLLMSession(BaseModel):
 
     interface: Literal[SessionInterface.LLM]
     request: LLMRequest
+    retry_of_call_id: str | None = None
 
     @model_validator(mode="after")
     def reject_structured_streaming(self) -> "CreateLLMSession":
@@ -78,6 +79,7 @@ class CreateChatSession(BaseModel):
 
     interface: Literal[SessionInterface.CHAT_COMPLETIONS]
     request: ChatCompletionRequest
+    retry_of_call_id: str | None = None
 
     @model_validator(mode="after")
     def reject_structured_streaming(self) -> "CreateChatSession":
@@ -91,6 +93,7 @@ class CreateResponsesSession(BaseModel):
 
     interface: Literal[SessionInterface.RESPONSES]
     request: ResponseCreateRequest
+    retry_of_call_id: str | None = None
 
     @model_validator(mode="after")
     def reject_structured_streaming(self) -> "CreateResponsesSession":
@@ -109,14 +112,21 @@ class StreamSession(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     session_id: str = Field(min_length=1)
+    retry_of_call_id: str | None = None
     interface: SessionInterface
     requested_model: ModelEnum
     status: SessionStatus
-    generation_id: str = Field(min_length=1)
     request_fingerprint: str = Field(min_length=1)
     idempotency_key: str | None = None
     owner_id: str | None = None
-    version: int = Field(default=0, ge=0)
+    actual_model: ModelEnum | None = None
+    prompt_name: str | None = None
+    prompt_version: str | None = None
+    input_tokens: int = Field(default=0, ge=0)
+    output_tokens: int = Field(default=0, ge=0)
+    cost_usd: float = Field(default=0, ge=0)
+    latency_ms: int = Field(default=0, ge=0)
+    attempts: int = Field(default=0, ge=0)
     result_text: str | None = None
     error_code: str | None = None
     replay_degraded: bool = False
@@ -144,7 +154,6 @@ class RuntimeEvent(BaseModel):
 
     event_id: str | None = None
     type: RuntimeEventType
-    generation_id: str = Field(min_length=1)
     connection_id: str | None = None
     data: dict[str, Any] = Field(default_factory=dict)
     created_at: AwareDatetime

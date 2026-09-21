@@ -21,14 +21,15 @@ class RetryConfig(BaseModel):
     backoff_multiplier: float = Field(ge=1)
 
 
-class JsonParsingConfig(BaseModel):
+class JsonRetryPromptVersion(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    retry_prompt: str = Field(min_length=1, max_length=20_000)
+    renderer: Literal["str-format-v1"]
+    template: str = Field(min_length=1, max_length=20_000)
 
-    @field_validator("retry_prompt")
+    @field_validator("template")
     @classmethod
-    def validate_retry_prompt(cls, value: str) -> str:
+    def validate_template(cls, value: str) -> str:
         allowed = {
             "missing_parameters",
             "invalid_parameters",
@@ -42,28 +43,73 @@ class JsonParsingConfig(BaseModel):
                 if field_name is not None
             }
         except ValueError as exc:
-            raise ValueError("json_parsing.retry_prompt contains invalid braces") from exc
+            raise ValueError(
+                "json_parsing.retry_prompt template contains invalid braces"
+            ) from exc
 
         missing = allowed - fields
         unknown = fields - allowed
         if missing:
             raise ValueError(
-                "json_parsing.retry_prompt is missing placeholders: "
+                "json_parsing.retry_prompt template is missing placeholders: "
                 + ", ".join(sorted(missing))
             )
         if unknown:
             raise ValueError(
-                "json_parsing.retry_prompt contains unknown placeholders: "
+                "json_parsing.retry_prompt template contains unknown placeholders: "
                 + ", ".join(sorted(unknown))
             )
         return value
 
 
+class JsonRetryPromptConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    active_version: str = Field(min_length=1)
+    versions: dict[str, JsonRetryPromptVersion] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_active_version(self) -> "JsonRetryPromptConfig":
+        if self.active_version not in self.versions:
+            raise ValueError(
+                "json_parsing.retry_prompt active_version "
+                f"'{self.active_version}' is not defined in versions"
+            )
+        return self
+
+    @property
+    def active(self) -> JsonRetryPromptVersion:
+        return self.versions[self.active_version]
+
+
+class JsonParsingConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    retry_prompt: JsonRetryPromptConfig
+
+
+class PostgresConnectionConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    host_env: str = Field(min_length=1)
+    port_env: str = Field(min_length=1)
+    dbname_env: str = Field(min_length=1)
+    user_env: str = Field(min_length=1)
+    password_env: str = Field(min_length=1)
+
+
+class RedisConnectionConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    host_env: str = Field(min_length=1)
+    port_env: str = Field(min_length=1)
+    password_env: str = Field(min_length=1)
+    database_env: str = Field(min_length=1)
+
+
 class SessionRuntimeConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    postgres_dsn_env: str = Field(default="GATEWAY_POSTGRES_DSN", min_length=1)
-    redis_url_env: str = Field(default="GATEWAY_REDIS_URL", min_length=1)
     snowflake_worker_id_env: str = Field(
         default="GATEWAY_SNOWFLAKE_WORKER_ID", min_length=1
     )
@@ -120,6 +166,8 @@ class GatewayConfig(BaseModel):
     app: ApplicationConfig
     retry: RetryConfig
     json_parsing: JsonParsingConfig
+    postgres: PostgresConnectionConfig
+    redis: RedisConnectionConfig
     sessions: SessionRuntimeConfig = Field(default_factory=SessionRuntimeConfig)
     providers: dict[ModelProviderEnum, ProviderConfig] = Field(min_length=1)
     models: dict[ModelEnum, ModelRouteConfig] = Field(min_length=1)

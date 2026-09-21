@@ -6,6 +6,7 @@ from app.core.utils import encode_sse
 from app.model.enums import LLMProtocolEnum, ModelEnum
 from app.model.request import LLMRequest, Message
 from app.model.response import Usage
+from app.model.session import SessionInterface
 from app.model.responses import (
     ResponseCompletedEvent,
     ResponseContentPartAddedEvent,
@@ -32,7 +33,9 @@ class ResponsesService:
 
     async def complete(self, request: ResponseCreateRequest) -> ResponseObject:
         response = await self._llm_service.complete(
-            self.to_llm_request(request), required_protocol=LLMProtocolEnum.RESPONSES
+            self.to_llm_request(request),
+            required_protocol=LLMProtocolEnum.RESPONSES,
+            interface=SessionInterface.RESPONSES,
         )
         return self._response_object(
             response.model,
@@ -42,7 +45,9 @@ class ResponsesService:
 
     def stream(self, request: ResponseCreateRequest) -> AsyncIterator[str]:
         events = self._llm_service.stream_events(
-            self.to_llm_request(request), required_protocol=LLMProtocolEnum.RESPONSES
+            self.to_llm_request(request),
+            required_protocol=LLMProtocolEnum.RESPONSES,
+            interface=SessionInterface.RESPONSES,
         )
         return self._stream(events, request.model)
 

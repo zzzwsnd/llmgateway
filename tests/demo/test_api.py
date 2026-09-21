@@ -4,7 +4,9 @@ from datetime import datetime, timezone
 from fastapi.testclient import TestClient
 
 from app.core.errors import GatewayError
-from app.main import create_app
+from app.core.config import get_gateway_config
+from app.main import _build_default_services, create_app
+from app.mapper.postgres_trace_mapper import PostgresTraceMapper
 from app.model.entity import CallTrace
 from app.model.request import LLMRequest
 from app.model.response import LLMResponse, Usage
@@ -42,7 +44,7 @@ class FakeTraceService:
     def __init__(self, traces: list[CallTrace] | None = None) -> None:
         self.traces = list(traces or [])
 
-    def list_traces(self) -> list[CallTrace]:
+    async def list_traces(self) -> list[CallTrace]:
         return list(self.traces)
 
 
@@ -178,6 +180,15 @@ def test_trace_endpoint_returns_service_traces() -> None:
 
     assert response.status_code == 200
     assert response.json() == [trace.model_dump(mode="json")]
+
+
+def test_default_services_use_postgres_for_call_audit() -> None:
+    services = _build_default_services(get_gateway_config())
+
+    assert isinstance(
+        services.trace._trace_dao._mapper,
+        PostgresTraceMapper,
+    )
 
 
 def test_gateway_error_is_converted_globally() -> None:

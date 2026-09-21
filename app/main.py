@@ -23,7 +23,7 @@ from app.dao.session_dao import SessionDao
 from app.mapper.chat_completions_mapper import ChatCompletionsMapper
 from app.mapper.memory_model_mapper import MemoryModelMapper
 from app.mapper.memory_prompt_mapper import MemoryPromptMapper
-from app.mapper.memory_trace_mapper import MemoryTraceMapper
+from app.mapper.postgres_trace_mapper import PostgresTraceMapper
 from app.mapper.responses_mapper import ResponsesMapper
 from app.mapper.runtime_mapper import RedisRuntimeMapper
 from app.mapper.session_mapper import PostgresSessionMapper
@@ -57,7 +57,10 @@ class _ApplicationServices:
 def _build_default_services(config: GatewayConfig) -> _ApplicationServices:
     model_dao = ModelDao(MemoryModelMapper(config))
     prompt_service = PromptService(PromptDao(MemoryPromptMapper()))
-    trace_service = TraceService(model_dao, TraceDao(MemoryTraceMapper()))
+    trace_service = TraceService(
+        model_dao,
+        TraceDao(PostgresTraceMapper(config.postgres)),
+    )
 
     protocol_factory = ProtocolFactory(
         {
@@ -84,10 +87,10 @@ def _build_default_services(config: GatewayConfig) -> _ApplicationServices:
         trace_service=trace_service,
     )
     session_config = config.sessions
-    session_dao = SessionDao(PostgresSessionMapper(session_config.postgres_dsn_env))
+    session_dao = SessionDao(PostgresSessionMapper(config.postgres))
     runtime_dao = RuntimeDao(
         RedisRuntimeMapper(
-            session_config.redis_url_env,
+            config.redis,
             event_ttl_seconds=session_config.event_ttl_seconds,
         )
     )

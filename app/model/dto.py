@@ -25,12 +25,20 @@ class ProviderRequest:
 
 
 @dataclass(frozen=True)
+class ProviderStreamChunk:
+    delta: str | None = None
+    usage: Usage | None = None
+
+
+@dataclass(frozen=True)
 class ProviderStreamEvent:
     type: Literal["text_delta", "completed", "failed"]
     delta: str | None = None
     model: ModelEnum | None = None
     error_code: str | None = None
     upstream_first_delta_latency_ms: int | None = None
+    attempts: int | None = None
+    latency_ms: int | None = None
 
 
 @dataclass(frozen=True)

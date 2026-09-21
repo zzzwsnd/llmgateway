@@ -2,7 +2,7 @@ from collections.abc import AsyncIterator
 from typing import Protocol
 
 from app.model.config import ModelRouteConfig, ProviderConfig
-from app.model.dto import ProviderCompletion, ProviderRequest
+from app.model.dto import ProviderCompletion, ProviderRequest, ProviderStreamChunk
 
 
 class ProviderDao(Protocol):
@@ -19,7 +19,7 @@ class ProviderDao(Protocol):
         provider: ProviderConfig,
         model: ModelRouteConfig,
         request: ProviderRequest,
-    ) -> AsyncIterator[str]:
+    ) -> AsyncIterator[ProviderStreamChunk]:
         raise NotImplementedError
 
 
@@ -37,7 +37,7 @@ class ChatCompletionsMapper(Protocol):
         provider: ProviderConfig,
         model: ModelRouteConfig,
         request: ProviderRequest,
-    ) -> AsyncIterator[str]:
+    ) -> AsyncIterator[ProviderStreamChunk]:
         raise NotImplementedError
 
 
@@ -55,7 +55,7 @@ class ResponsesMapper(Protocol):
         provider: ProviderConfig,
         model: ModelRouteConfig,
         request: ProviderRequest,
-    ) -> AsyncIterator[str]:
+    ) -> AsyncIterator[ProviderStreamChunk]:
         raise NotImplementedError
 
 
@@ -76,7 +76,7 @@ class ChatCompletionsDao:
         provider: ProviderConfig,
         model: ModelRouteConfig,
         request: ProviderRequest,
-    ) -> AsyncIterator[str]:
+    ) -> AsyncIterator[ProviderStreamChunk]:
         return self._mapper.stream(provider, model, request)
 
 
@@ -97,5 +97,5 @@ class ResponsesDao:
         provider: ProviderConfig,
         model: ModelRouteConfig,
         request: ProviderRequest,
-    ) -> AsyncIterator[str]:
+    ) -> AsyncIterator[ProviderStreamChunk]:
         return self._mapper.stream(provider, model, request)

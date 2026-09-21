@@ -8,21 +8,61 @@ retry:
   backoff_multiplier: 2
 
 json_parsing:
-  retry_prompt: |
-    你上一次返回的 JSON 未通过校验。
+  retry_prompt:
+    active_version: json-repair-v1
+    versions:
+      json-repair-v1:
+        renderer: str-format-v1
+        template: |
+          # 身份
+          [权重:100] 你是 JSON Schema 纠错与重生成工程师。你的职责是根据失败诊断和给定 JSON Schema，重建一个可被程序直接消费的 JSON 值。
 
-    缺失参数：{missing_parameters}
-    错误参数：{invalid_parameters}
-    JSON 格式错误：{json_error}
+          # 目标
+          [权重:100] 输出必须能被标准 JSON 解析器直接解析。
+          [权重:100] 输出必须通过给定 JSON Schema 的全部约束。
+          [权重:90] 修复下列全部已知问题，不得遗漏任何一项：
+          [权重:90] - 缺失参数：{missing_parameters}
+          [权重:90] - 错误参数：{invalid_parameters}
+          [权重:90] - JSON 格式错误：{json_error}
 
-    请严格按照以下 JSON Schema 重新生成完整且合法的 JSON：
-    {schema}
+          # JSON Schema
+          {schema}
 
-    只返回 JSON，不要输出 Markdown 代码块、解释或其他内容。
+          # 边界与输出风格
+          [权重:100] 只输出一个 JSON 值；禁止输出 Markdown 代码块、解释、注释、前缀、后缀或多个候选结果。
+          [权重:100] 所有对象键和字符串必须使用双引号；禁止尾随逗号、未闭合括号以及 JSON 标准之外的字面量。
+          [权重:100] 实际失败诊断和 JSON Schema 高于示例；禁止复制与当前 Schema 不匹配的示例字段。
+          [权重:90] 缺失字段必须补齐，并使用符合对应 Schema 类型及约束的值。
+          [权重:90] 错误字段必须修正类型、枚举、范围、格式或结构，直至满足对应 Schema 约束。
+          [权重:70] 对未被诊断为错误且符合 Schema 的已有字段保持原值，避免无关改写。
+
+          # 可检查的操作步骤
+          [权重:90] 1. 读取失败诊断和 JSON Schema；确认根类型、required、properties、items、enum、format、范围及 additionalProperties 约束。
+          [权重:90] 2. 补齐缺失字段，修正错误字段；存在语法错误时重建完整 JSON，并确保括号成对、字符串闭合。
+          [权重:90] 3. 输出前逐项检查：结果可被 JSON 解析器解析；所有诊断已修复；结果通过 Schema；结果之外没有任何文本。
+
+          # Few-shot 示例（仅展示格式，实际任务以当前诊断和 Schema 为准）
+          [权重:70] 正例：{{"name":"Ada","age":37}}
+          [权重:70] 反例一：```json {{"name":"Ada","age":37}} ```，原因：包含 Markdown 代码块和 JSON 之外的文本。
+          [权重:70] 反例二：{{"name":"Ada","age":"37"}}，原因：age 使用字符串，未满足 integer 类型约束。
+
+          # 静默自检
+          [权重:100] 在内部完成解析性、Schema 一致性和纯 JSON 输出检查；最终只返回检查通过的 JSON，不得输出检查过程。
+
+postgres:
+  host_env: GATEWAY_POSTGRES_HOST
+  port_env: GATEWAY_POSTGRES_PORT
+  dbname_env: GATEWAY_POSTGRES_DBNAME
+  user_env: GATEWAY_POSTGRES_USER
+  password_env: GATEWAY_POSTGRES_PASSWORD
+
+redis:
+  host_env: GATEWAY_REDIS_HOST
+  port_env: GATEWAY_REDIS_PORT
+  password_env: GATEWAY_REDIS_PASSWORD
+  database_env: GATEWAY_REDIS_DATABASE
 
 sessions:
-  postgres_dsn_env: GATEWAY_POSTGRES_DSN
-  redis_url_env: GATEWAY_REDIS_URL
   snowflake_worker_id_env: GATEWAY_SNOWFLAKE_WORKER_ID
   max_active_sessions: 100
   max_queued_sessions: 100

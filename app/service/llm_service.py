@@ -1,8 +1,9 @@
 import asyncio
+import hashlib
 import time
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import replace
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from app.core.errors import (
@@ -16,9 +17,16 @@ from app.core.logging import logger
 from app.core.utils import encode_sse
 from app.model.config import GatewayConfig, ModelRouteConfig
 from app.model.dto import ProviderRequest, ProviderStreamEvent
+from app.model.entity import (
+    AttemptStatus,
+    AttemptType,
+    CallAttempt,
+    JsonValidationStatus,
+)
 from app.model.enums import LLMProtocolEnum, ModelEnum
-from app.model.request import LLMRequest, Message
+from app.model.request import LLMRequest, Message, PromptSelection
 from app.model.response import LLMResponse, Usage
+from app.model.session import SessionInterface
 from app.service.prompt_service import PromptService
 from app.service.provider_factory import ProviderFactory
 from app.service.trace_service import TraceService
@@ -42,6 +50,8 @@ class LLMService:
         self,
         request: LLMRequest,
         required_protocol: LLMProtocolEnum | None = None,
+        *,
+        interface: SessionInterface = SessionInterface.LLM,
     ) -> LLMResponse:
         if request.stream:
             raise GatewayError(
@@ -71,11 +81,24 @@ class LLMService:
             max_output_tokens=request.max_output_tokens,
         )
 
-        for model_name in self._model_sequence(requested_model):
+        await self._trace_service.start_call(
+            call_id=request_id,
+            requested_model=requested_model,
+            prompt=request.prompt,
+            interface=interface,
+        )
+
+        next_retry_type = AttemptType.RETRY
+        attempt_prompt = request.prompt
+        attempt_prompt_sha256 = None
+        for model_index, model_name in enumerate(
+            self._model_sequence(requested_model)
+        ):
             try:
                 config = self._validate_model(
                     model_name, request.response_schema, required_protocol
                 )
+                provider = self._provider_factory.get(config.provider)
             except GatewayError as exc:
                 if model_name == requested_model:
                     raise
@@ -85,20 +108,72 @@ class LLMService:
             for retry_number in range(
                 self._gateway_config.retry.max_retries_per_model + 1
             ):
+                if attempts == 0:
+                    attempt_type = AttemptType.INITIAL
+                elif retry_number == 0 and model_index > 0:
+                    attempt_type = AttemptType.FALLBACK
+                else:
+                    attempt_type = next_retry_type
+                next_retry_type = AttemptType.RETRY
                 attempts += 1
+                attempt_started = time.monotonic()
+                attempt = await self._trace_service.start_attempt(
+                    call_id=request_id,
+                    model=model_name,
+                    prompt=attempt_prompt,
+                    attempt_type=attempt_type,
+                    json_requested=request.response_schema is not None,
+                    prompt_sha256=attempt_prompt_sha256,
+                )
+                completion = None
                 try:
-                    provider = self._provider_factory.get(config.provider)
                     completion = await provider.complete(config, provider_request)
-                    total_usage = Usage(
-                        input_tokens=(
-                            total_usage.input_tokens + completion.usage.input_tokens
-                        ),
-                        output_tokens=(
-                            total_usage.output_tokens + completion.usage.output_tokens
+                except GatewayError as exc:
+                    await self._finish_attempt_audit(
+                        attempt,
+                        status=AttemptStatus.FAILED,
+                        usage=Usage(input_tokens=0, output_tokens=0),
+                        latency_ms=self._attempt_elapsed_ms(attempt_started),
+                        error_code=exc.code,
+                    )
+                    await self._finish_call_audit(
+                        request_id, status="failed", error_code=exc.code
+                    )
+                    raise
+                except Exception as exc:
+                    last_error = exc
+                    retryable = isinstance(exc, RetryableProviderError)
+                    await self._finish_attempt_audit(
+                        attempt,
+                        status=AttemptStatus.FAILED,
+                        usage=Usage(input_tokens=0, output_tokens=0),
+                        latency_ms=self._attempt_elapsed_ms(attempt_started),
+                        error_code=(
+                            "retryable_provider_error"
+                            if retryable
+                            else "provider_error"
                         ),
                     )
-                    content = completion.content
-                    parsed = None
+                    if (
+                        retryable
+                        and retry_number
+                        < self._gateway_config.retry.max_retries_per_model
+                    ):
+                        await asyncio.sleep(self._retry_delay(retry_number))
+                        continue
+                    break
+
+                total_usage = Usage(
+                    input_tokens=(
+                        total_usage.input_tokens + completion.usage.input_tokens
+                    ),
+                    output_tokens=(
+                        total_usage.output_tokens + completion.usage.output_tokens
+                    ),
+                )
+                content = completion.content
+                parsed = None
+                try:
                     if request.response_schema is not None:
                         parse_result = self._json_output_parser.parse(
                             completion.content,
@@ -106,32 +181,29 @@ class LLMService:
                         )
                         content = parse_result.content
                         parsed = parse_result.value
-                    response = LLMResponse(
-                        request_id=request_id,
-                        model=model_name,
-                        content=content,
-                        parsed=parsed,
-                        usage=total_usage,
-                        latency_ms=self._elapsed_ms(started),
-                        attempts=attempts,
-                    )
-                    self._trace_service.record(
-                        request_id=request_id,
-                        requested_model=requested_model,
-                        actual_model=model_name,
-                        prompt=request.prompt,
-                        usage=total_usage,
-                        latency_ms=response.latency_ms,
-                        attempts=attempts,
-                        status="success",
-                    )
-                    return response
+                        json_status = (
+                            JsonValidationStatus.REPAIRED
+                            if parse_result.repaired
+                            else JsonValidationStatus.VALID
+                        )
+                    else:
+                        json_status = JsonValidationStatus.NOT_REQUESTED
                 except JsonOutputValidationError as exc:
                     last_error = exc
+                    await self._finish_attempt_audit(
+                        attempt,
+                        status=AttemptStatus.INVALID_OUTPUT,
+                        usage=completion.usage,
+                        latency_ms=self._attempt_elapsed_ms(attempt_started),
+                        error_code=exc.code,
+                        json_validation_status=JsonValidationStatus.INVALID,
+                        json_validation_errors=self._json_validation_errors(exc),
+                    )
                     if (
                         retry_number
                         < self._gateway_config.retry.max_retries_per_model
                     ):
+                        next_retry_type = AttemptType.JSON_RETRY
                         retry_messages = list(messages)
                         if completion.content:
                             retry_messages.append(
@@ -144,6 +216,15 @@ class LLMService:
                             provider_request,
                             messages=retry_messages,
                         )
+                        attempt_prompt = PromptSelection(
+                            name="json-repair",
+                            version=(
+                                self._gateway_config.json_parsing.retry_prompt.active_version
+                            ),
+                        )
+                        attempt_prompt_sha256 = hashlib.sha256(
+                            exc.retry_prompt.encode("utf-8")
+                        ).hexdigest()
                         await asyncio.sleep(self._retry_delay(retry_number))
                         continue
 
@@ -155,52 +236,38 @@ class LLMService:
                             else "Model output does not match response_schema"
                         ),
                     )
-                    self._trace_service.record(
-                        request_id=request_id,
-                        requested_model=requested_model,
-                        actual_model=model_name,
-                        prompt=request.prompt,
-                        usage=total_usage,
-                        latency_ms=self._elapsed_ms(started),
-                        attempts=attempts,
+                    await self._finish_call_audit(
+                        request_id,
                         status="failed",
                         error_code=gateway_error.code,
                     )
                     raise gateway_error from exc
-                except GatewayError as exc:
-                    self._trace_service.record(
-                        request_id=request_id,
-                        requested_model=requested_model,
-                        actual_model=model_name,
-                        prompt=request.prompt,
-                        usage=total_usage,
-                        latency_ms=self._elapsed_ms(started),
-                        attempts=attempts,
-                        status="failed",
-                        error_code=exc.code,
-                    )
-                    raise
-                except Exception as exc:
-                    last_error = exc
-                    if (
-                        isinstance(exc, RetryableProviderError)
-                        and retry_number
-                        < self._gateway_config.retry.max_retries_per_model
-                    ):
-                        await asyncio.sleep(self._retry_delay(retry_number))
-                        continue
-                    break
 
-        latency_ms = self._elapsed_ms(started)
+                await self._finish_attempt_audit(
+                    attempt,
+                    status=AttemptStatus.SUCCESS,
+                    usage=completion.usage,
+                    latency_ms=self._attempt_elapsed_ms(attempt_started),
+                    json_validation_status=json_status,
+                )
+                response = LLMResponse(
+                    request_id=request_id,
+                    model=model_name,
+                    content=content,
+                    parsed=parsed,
+                    usage=total_usage,
+                    latency_ms=self._elapsed_ms(started),
+                    attempts=attempts,
+                )
+                await self._finish_call_audit(
+                    request_id,
+                    status="success",
+                )
+                return response
+
         error_code = "model_unavailable"
-        self._trace_service.record(
-            request_id=request_id,
-            requested_model=requested_model,
-            actual_model=None,
-            prompt=request.prompt,
-            usage=total_usage,
-            latency_ms=latency_ms,
-            attempts=attempts,
+        await self._finish_call_audit(
+            request_id,
             status="failed",
             error_code=error_code,
         )
@@ -212,10 +279,19 @@ class LLMService:
         self,
         request: LLMRequest,
         required_protocol: LLMProtocolEnum | None = None,
+        *,
+        existing_call_id: str | None = None,
+        interface: SessionInterface = SessionInterface.LLM,
     ) -> AsyncIterator[ProviderStreamEvent]:
         self.validate_stream_request(request, required_protocol)
         messages = self._prompt_service.build_messages(request)
-        return self._stream_events(request, messages, required_protocol)
+        return self._stream_events(
+            request,
+            messages,
+            required_protocol,
+            existing_call_id=existing_call_id,
+            interface=interface,
+        )
 
     def validate_stream_request(
         self,
@@ -238,13 +314,17 @@ class LLMService:
         request: LLMRequest,
         messages: list[Message],
         required_protocol: LLMProtocolEnum | None,
+        *,
+        existing_call_id: str | None,
+        interface: SessionInterface,
     ) -> AsyncIterator[ProviderStreamEvent]:
         started = time.perf_counter()
         attempts = 0
         emitted = False
         last_error: Exception | None = None
         upstream_started: float | None = None
-        request_id = str(uuid4())
+        request_id = existing_call_id or str(uuid4())
+        owns_call = existing_call_id is None
         provider_request = ProviderRequest(
             messages=messages,
             timeout_seconds=request.timeout_seconds,
@@ -254,8 +334,17 @@ class LLMService:
             max_output_tokens=request.max_output_tokens,
         )
 
+        if owns_call:
+            await self._trace_service.start_call(
+                call_id=request_id,
+                requested_model=request.model,
+                prompt=request.prompt,
+                stream=True,
+                interface=interface,
+            )
+
         stop_model_sequence = False
-        for model_name in self._model_sequence(request.model):
+        for model_index, model_name in enumerate(self._model_sequence(request.model)):
             try:
                 config = self._validate_model(model_name, None, required_protocol)
                 provider = self._provider_factory.get(config.provider)
@@ -270,17 +359,36 @@ class LLMService:
             for retry_number in range(
                 self._gateway_config.retry.max_retries_per_model + 1
             ):
+                if attempts == 0:
+                    attempt_type = AttemptType.INITIAL
+                elif retry_number == 0 and model_index > 0:
+                    attempt_type = AttemptType.FALLBACK
+                else:
+                    attempt_type = AttemptType.RETRY
                 attempts += 1
+                attempt_started = time.monotonic()
+                attempt = await self._trace_service.start_attempt(
+                    call_id=request_id,
+                    model=model_name,
+                    prompt=request.prompt,
+                    attempt_type=attempt_type,
+                    json_requested=False,
+                )
                 attempt_request = replace(
                     provider_request, stream_resume_token=resume_token
                 )
                 provider_stream = None
                 attempt_emitted = False
+                attempt_first_delta_ms = None
+                attempt_usage = Usage(input_tokens=0, output_tokens=0)
                 try:
                     provider_stream = provider.stream(config, attempt_request)
                     if upstream_started is None:
                         upstream_started = time.perf_counter()
-                    async for delta in provider_stream:
+                    async for chunk in provider_stream:
+                        if chunk.usage is not None:
+                            attempt_usage = chunk.usage
+                        delta = chunk.delta
                         if not delta:
                             continue
                         first_delta_latency_ms = None
@@ -289,26 +397,45 @@ class LLMService:
                         emitted = True
                         model_emitted = True
                         attempt_emitted = True
+                        if attempt_first_delta_ms is None:
+                            attempt_first_delta_ms = self._attempt_elapsed_ms(
+                                attempt_started
+                            )
                         yield ProviderStreamEvent(
                             type="text_delta",
                             delta=delta,
                             upstream_first_delta_latency_ms=first_delta_latency_ms,
                         )
-
-                    self._trace_service.record(
-                        request_id=request_id,
-                        requested_model=request.model,
-                        actual_model=model_name,
-                        prompt=request.prompt,
-                        usage=Usage(input_tokens=0, output_tokens=0),
-                        latency_ms=self._elapsed_ms(started),
-                        attempts=attempts,
-                        status="success",
+                except (asyncio.CancelledError, GeneratorExit):
+                    await self._finish_attempt_audit(
+                        attempt,
+                        status=AttemptStatus.CANCELLED,
+                        usage=attempt_usage,
+                        latency_ms=self._attempt_elapsed_ms(attempt_started),
+                        first_delta_latency_ms=attempt_first_delta_ms,
+                        error_code="stream_cancelled",
                     )
-                    yield ProviderStreamEvent(type="completed", model=model_name)
-                    return
+                    if owns_call:
+                        await self._finish_call_audit(
+                            request_id,
+                            status="cancelled",
+                            error_code="stream_cancelled",
+                        )
+                    raise
                 except Exception as exc:
                     last_error = exc
+                    await self._finish_attempt_audit(
+                        attempt,
+                        status=AttemptStatus.FAILED,
+                        usage=attempt_usage,
+                        latency_ms=self._attempt_elapsed_ms(attempt_started),
+                        first_delta_latency_ms=attempt_first_delta_ms,
+                        error_code=(
+                            "retryable_provider_error"
+                            if isinstance(exc, RetryableProviderError)
+                            else "provider_error"
+                        ),
+                    )
                     retryable = isinstance(exc, RetryableProviderError)
                     next_resume_token = None
                     if retryable:
@@ -334,26 +461,92 @@ class LLMService:
                         if close is not None:
                             await close()
 
+                await self._finish_attempt_audit(
+                    attempt,
+                    status=AttemptStatus.SUCCESS,
+                    usage=attempt_usage,
+                    latency_ms=self._attempt_elapsed_ms(attempt_started),
+                    first_delta_latency_ms=attempt_first_delta_ms,
+                )
+                latency_ms = self._elapsed_ms(started)
+                if owns_call:
+                    await self._finish_call_audit(request_id, status="success")
+                yield ProviderStreamEvent(
+                    type="completed",
+                    model=model_name,
+                    attempts=attempts,
+                    latency_ms=latency_ms,
+                )
+                return
+
             if stop_model_sequence:
                 break
 
         if last_error is not None:
-            logger.error(
-                "upstream stream failed",
-                exc_info=(type(last_error), last_error, last_error.__traceback__),
+            logger.error("upstream stream failed")
+        latency_ms = self._elapsed_ms(started)
+        if owns_call:
+            await self._finish_call_audit(
+                request_id,
+                status="failed",
+                error_code="upstream_stream_failed",
             )
-        self._trace_service.record(
-            request_id=request_id,
-            requested_model=request.model,
-            actual_model=None,
-            prompt=request.prompt,
-            usage=Usage(input_tokens=0, output_tokens=0),
-            latency_ms=self._elapsed_ms(started),
-            attempts=attempts,
-            status="failed",
+        yield ProviderStreamEvent(
+            type="failed",
             error_code="upstream_stream_failed",
+            attempts=attempts,
+            latency_ms=latency_ms,
         )
-        yield ProviderStreamEvent(type="failed", error_code="upstream_stream_failed")
+
+    async def _finish_attempt_audit(
+        self,
+        attempt: CallAttempt,
+        *,
+        status: AttemptStatus,
+        usage: Usage,
+        latency_ms: int,
+        first_delta_latency_ms: int | None = None,
+        error_code: str | None = None,
+        json_validation_status: JsonValidationStatus | None = None,
+        json_validation_errors: list[dict[str, str]] | None = None,
+    ) -> None:
+        try:
+            await self._trace_service.finish_attempt(
+                attempt,
+                status=status,
+                usage=usage,
+                latency_ms=latency_ms,
+                first_delta_latency_ms=first_delta_latency_ms,
+                error_code=error_code,
+                json_validation_status=json_validation_status,
+                json_validation_errors=json_validation_errors,
+            )
+        except Exception as exc:
+            raise self._audit_persistence_error() from exc
+
+    async def _finish_call_audit(
+        self,
+        call_id: str,
+        *,
+        status: Literal["success", "failed", "cancelled"],
+        error_code: str | None = None,
+    ) -> None:
+        try:
+            await self._trace_service.finish_call(
+                call_id,
+                status=status,
+                error_code=error_code,
+            )
+        except Exception as exc:
+            raise self._audit_persistence_error() from exc
+
+    @staticmethod
+    def _audit_persistence_error() -> GatewayError:
+        return GatewayError(
+            "audit_persistence_failed",
+            "Call audit persistence is unavailable",
+            503,
+        )
 
     async def _legacy_stream(
         self, events: AsyncIterator[ProviderStreamEvent]
@@ -417,6 +610,29 @@ class LLMService:
     @staticmethod
     def _elapsed_ms(started: float) -> int:
         return int((time.perf_counter() - started) * 1000)
+
+    @staticmethod
+    def _attempt_elapsed_ms(started: float) -> int:
+        return int((time.monotonic() - started) * 1000)
+
+    @staticmethod
+    def _json_validation_errors(
+        error: JsonOutputValidationError,
+    ) -> list[dict[str, str]]:
+        issues = [
+            {"path": path, "code": "missing"}
+            for path in error.missing_parameters
+        ]
+        issues.extend(
+            {
+                "path": description.split(":", 1)[0],
+                "code": "invalid",
+            }
+            for description in error.invalid_parameters
+        )
+        if not issues:
+            issues.append({"path": "$", "code": error.code})
+        return issues
 
     def _retry_delay(self, retry_number: int) -> float:
         retry = self._gateway_config.retry

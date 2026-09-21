@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 from collections.abc import AsyncIterator
 from typing import Any
@@ -14,10 +15,17 @@ from app.mapper.memory_model_mapper import MemoryModelMapper
 from app.mapper.memory_prompt_mapper import MemoryPromptMapper
 from app.mapper.memory_trace_mapper import MemoryTraceMapper
 from app.model.config import GatewayConfig, ModelRouteConfig, ProviderConfig
-from app.model.dto import ProviderCompletion, ProviderRequest, ProviderStreamEvent
+from app.model.dto import (
+    ProviderCompletion,
+    ProviderRequest,
+    ProviderStreamChunk,
+    ProviderStreamEvent,
+)
+from app.model.entity import AttemptStatus, AttemptType, JsonValidationStatus
 from app.model.enums import LLMProtocolEnum, ModelEnum, ModelProviderEnum
 from app.model.request import LLMRequest, Message
 from app.model.response import Usage
+from app.model.session import SessionInterface
 from app.service.llm_service import LLMService
 from app.service.prompt_service import PromptService
 from app.service.protocol_factory import ProtocolFactory
@@ -30,7 +38,7 @@ class FakeProtocolDao:
     def __init__(
         self,
         completions: list[ProviderCompletion | Exception] | None = None,
-        streams: list[list[str | Exception]] | None = None,
+        streams: list[list[str | ProviderStreamChunk | Exception]] | None = None,
     ) -> None:
         self.completions = list(completions or [])
         self.streams = list(streams or [])
@@ -58,14 +66,18 @@ class FakeProtocolDao:
         provider: ProviderConfig,
         model: ModelRouteConfig,
         request: ProviderRequest,
-    ) -> AsyncIterator[str]:
+    ) -> AsyncIterator[ProviderStreamChunk]:
         self.stream_models.append(model.provider_model)
         self.providers.append(provider)
         self.requests.append(request)
         for item in self.streams.pop(0):
             if isinstance(item, Exception):
                 raise item
-            yield item
+            yield (
+                ProviderStreamChunk(delta=item)
+                if isinstance(item, str)
+                else item
+            )
 
 
 class ClosableProtocolDao(FakeProtocolDao):
@@ -73,9 +85,11 @@ class ClosableProtocolDao(FakeProtocolDao):
         super().__init__()
         self.closed = False
 
-    async def stream(self, provider, model, request) -> AsyncIterator[str]:
+    async def stream(
+        self, provider, model, request
+    ) -> AsyncIterator[ProviderStreamChunk]:
         try:
-            yield "partial"
+            yield ProviderStreamChunk(delta="partial")
             await asyncio.Event().wait()
         finally:
             self.closed = True
@@ -108,12 +122,33 @@ def gateway_config(
                 "backoff_multiplier": backoff_multiplier,
             },
             "json_parsing": {
-                "retry_prompt": (
-                    "缺失参数：{missing_parameters}\n"
-                    "错误参数：{invalid_parameters}\n"
-                    "JSON 格式错误：{json_error}\n"
-                    "JSON Schema：{schema}"
-                )
+                "retry_prompt": {
+                    "active_version": "json-repair-v1",
+                    "versions": {
+                        "json-repair-v1": {
+                            "renderer": "str-format-v1",
+                            "template": (
+                                "缺失参数：{missing_parameters}\n"
+                                "错误参数：{invalid_parameters}\n"
+                                "JSON 格式错误：{json_error}\n"
+                                "JSON Schema：{schema}"
+                            ),
+                        }
+                    },
+                }
+            },
+            "postgres": {
+                "host_env": "TEST_POSTGRES_HOST",
+                "port_env": "TEST_POSTGRES_PORT",
+                "dbname_env": "TEST_POSTGRES_DBNAME",
+                "user_env": "TEST_POSTGRES_USER",
+                "password_env": "TEST_POSTGRES_PASSWORD",
+            },
+            "redis": {
+                "host_env": "TEST_REDIS_HOST",
+                "port_env": "TEST_REDIS_PORT",
+                "password_env": "TEST_REDIS_PASSWORD",
+                "database_env": "TEST_REDIS_DATABASE",
             },
             "providers": {
                 "deepseek": {
@@ -237,6 +272,21 @@ async def test_complete_routes_deepseek_model_through_its_provider_map_entry() -
     assert responses_dao.complete_models == []
 
 
+async def test_complete_persists_client_interface_on_logical_call() -> None:
+    service, traces, _, _ = build_service(
+        chat_dao=FakeProtocolDao(completions=[completion()])
+    )
+
+    response = await service.complete(
+        request(),
+        interface=SessionInterface.CHAT_COMPLETIONS,
+    )
+
+    call = await traces._trace_dao.get_call(response.request_id)
+    assert call is not None
+    assert call.interface is SessionInterface.CHAT_COMPLETIONS
+
+
 async def test_complete_routes_openai_model_through_its_provider_map_entry() -> None:
     service, _, chat_dao, responses_dao = build_service(
         responses_dao=FakeProtocolDao(completions=[completion()])
@@ -293,7 +343,18 @@ async def test_complete_retries_then_uses_yaml_fallback_for_the_same_protocol() 
         "deepseek-primary",
         "deepseek-backup",
     ]
-    assert traces.list_traces()[0].actual_model == ModelEnum.GENERAL_BACKUP
+    assert (await traces.list_traces())[0].actual_model == ModelEnum.GENERAL_BACKUP
+    attempts = await traces.list_attempts(response.request_id)
+    assert [item.attempt_type for item in attempts] == [
+        AttemptType.INITIAL,
+        AttemptType.RETRY,
+        AttemptType.FALLBACK,
+    ]
+    assert [item.status for item in attempts] == [
+        AttemptStatus.FAILED,
+        AttemptStatus.FAILED,
+        AttemptStatus.SUCCESS,
+    ]
 
 
 async def test_complete_uses_configured_exponential_backoff_before_fallback(
@@ -336,9 +397,64 @@ async def test_complete_returns_provider_result_and_records_trace() -> None:
     assert response.content == "answer"
     assert response.usage == Usage(input_tokens=10, output_tokens=20)
     assert response.attempts == 1
-    assert traces.list_traces()[0].actual_model == ModelEnum.GENERAL_PRIMARY
-    assert traces.list_traces()[0].status == "success"
-    assert traces.list_traces()[0].cost_usd == 0.00009
+    trace = (await traces.list_traces())[0]
+    assert trace.actual_model == ModelEnum.GENERAL_PRIMARY
+    assert trace.status == "success"
+    assert trace.cost_usd == 0.00009
+
+
+async def test_complete_does_not_retry_provider_when_success_attempt_audit_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = FakeProtocolDao(
+        completions=[completion("primary answer"), completion("backup answer")]
+    )
+    service, traces, _, _ = build_service(
+        chat_dao=provider,
+        config=gateway_config(max_retries_per_model=0),
+    )
+    original_finish_attempt = traces.finish_attempt
+    finish_attempt_calls = 0
+
+    async def fail_first_finish_attempt(*args: Any, **kwargs: Any):
+        nonlocal finish_attempt_calls
+        finish_attempt_calls += 1
+        if finish_attempt_calls == 1:
+            raise RuntimeError("audit database unavailable")
+        return await original_finish_attempt(*args, **kwargs)
+
+    monkeypatch.setattr(traces, "finish_attempt", fail_first_finish_attempt)
+
+    with pytest.raises(GatewayError) as captured:
+        await service.complete(request())
+
+    assert captured.value.code == "audit_persistence_failed"
+    assert provider.complete_models == ["deepseek-primary"]
+    trace = (await traces.list_traces())[0]
+    attempts = await traces.list_attempts(trace.request_id)
+    assert [item.status for item in attempts] == [AttemptStatus.RUNNING]
+
+
+async def test_complete_does_not_repeat_provider_when_call_audit_finalize_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = FakeProtocolDao(completions=[completion("answer")])
+    service, traces, _, _ = build_service(chat_dao=provider)
+
+    async def fail_finish_call(*args: Any, **kwargs: Any):
+        raise RuntimeError("audit database unavailable")
+
+    monkeypatch.setattr(traces, "finish_call", fail_finish_call)
+
+    with pytest.raises(GatewayError) as captured:
+        await service.complete(request())
+
+    assert captured.value.code == "audit_persistence_failed"
+    assert provider.complete_models == ["deepseek-primary"]
+    trace = (await traces.list_traces())[0]
+    assert trace.status == "running"
+    attempts = await traces.list_attempts(trace.request_id)
+    assert [item.status for item in attempts] == [AttemptStatus.SUCCESS]
 
 
 async def test_complete_rejects_stream_flag() -> None:
@@ -375,12 +491,15 @@ async def test_complete_records_usage_when_structured_output_validation_fails(
         await service.complete(request(response_schema=schema))
 
     assert error.value.code == error_code
-    trace = traces.list_traces()[0]
+    trace = (await traces.list_traces())[0]
     assert trace.status == "failed"
-    assert trace.actual_model == ModelEnum.GENERAL_PRIMARY
+    assert trace.actual_model is None
     assert trace.input_tokens == 10
     assert trace.output_tokens == 20
     assert trace.error_code == error_code
+    attempts = await traces.list_attempts(trace.request_id)
+    assert attempts[0].status is AttemptStatus.INVALID_OUTPUT
+    assert attempts[0].json_validation_status is JsonValidationStatus.INVALID
 
 
 async def test_complete_retries_invalid_parameters_with_configured_prompt() -> None:
@@ -412,10 +531,26 @@ async def test_complete_retries_invalid_parameters_with_configured_prompt() -> N
     retry_prompt = provider.requests[1].messages[-1].content
     assert "缺失参数：$.name" in retry_prompt
     assert "错误参数：$.age: 'old' is not of type 'integer'" in retry_prompt
-    assert len(traces.list_traces()) == 1
-    assert traces.list_traces()[0].status == "success"
-    assert traces.list_traces()[0].input_tokens == 20
-    assert traces.list_traces()[0].output_tokens == 40
+    trace_list = await traces.list_traces()
+    assert len(trace_list) == 1
+    assert trace_list[0].status == "success"
+    assert trace_list[0].input_tokens == 20
+    assert trace_list[0].output_tokens == 40
+    attempts = await traces.list_attempts(response.request_id)
+    assert [item.attempt_type for item in attempts] == [
+        AttemptType.INITIAL,
+        AttemptType.JSON_RETRY,
+    ]
+    assert attempts[0].status is AttemptStatus.INVALID_OUTPUT
+    assert attempts[0].json_validation_errors == [
+        {"path": "$.name", "code": "missing"},
+        {"path": "$.age", "code": "invalid"},
+    ]
+    assert attempts[1].prompt_name == "json-repair"
+    assert attempts[1].prompt_version == "json-repair-v1"
+    assert attempts[1].prompt_sha256 == hashlib.sha256(
+        retry_prompt.encode("utf-8")
+    ).hexdigest()
 
 
 async def test_complete_accepts_scalar_json_when_schema_allows_it() -> None:
@@ -456,13 +591,14 @@ async def test_complete_retries_unrepairable_json_then_returns_invalid_json() ->
     assert "JSON 格式错误：JSON 语法错误，无法自动修复" in (
         provider.requests[1].messages[-1].content
     )
-    assert traces.list_traces()[0].input_tokens == 20
-    assert traces.list_traces()[0].output_tokens == 40
+    trace = (await traces.list_traces())[0]
+    assert trace.input_tokens == 20
+    assert trace.output_tokens == 40
 
 
 async def test_complete_returns_bracket_repaired_json_without_retry() -> None:
     provider = FakeProtocolDao(completions=[completion('{"name":"Ada"')])
-    service, _, _, _ = build_service(chat_dao=provider)
+    service, traces, _, _ = build_service(chat_dao=provider)
 
     response = await service.complete(
         request(
@@ -478,6 +614,9 @@ async def test_complete_returns_bracket_repaired_json_without_retry() -> None:
     assert response.parsed == {"name": "Ada"}
     assert response.attempts == 1
     assert len(provider.requests) == 1
+    attempts = await traces.list_attempts(response.request_id)
+    assert len(attempts) == 1
+    assert attempts[0].json_validation_status is JsonValidationStatus.REPAIRED
 
 
 async def test_complete_records_provider_business_error() -> None:
@@ -490,9 +629,9 @@ async def test_complete_records_provider_business_error() -> None:
         await service.complete(request())
 
     assert error.value is provider_error
-    trace = traces.list_traces()[0]
+    trace = (await traces.list_traces())[0]
     assert trace.status == "failed"
-    assert trace.actual_model == ModelEnum.GENERAL_PRIMARY
+    assert trace.actual_model is None
     assert trace.input_tokens == 0
     assert trace.output_tokens == 0
     assert trace.error_code == "gateway_misconfigured"
@@ -509,7 +648,7 @@ async def test_complete_records_model_unavailable_after_all_models_fail() -> Non
         await service.complete(request())
 
     assert error.value.code == "model_unavailable"
-    trace = traces.list_traces()[0]
+    trace = (await traces.list_traces())[0]
     assert trace.status == "failed"
     assert trace.attempts == 4
     assert trace.error_code == "model_unavailable"
@@ -531,7 +670,61 @@ async def test_stream_events_exposes_typed_deltas_and_completion() -> None:
     assert events[0].upstream_first_delta_latency_ms is not None
     assert events[1].upstream_first_delta_latency_ms is None
     assert events[2].model is ModelEnum.GENERAL_PRIMARY
-    assert traces.list_traces()[0].status == "success"
+    assert (await traces.list_traces())[0].status == "success"
+
+
+async def test_stream_records_terminal_provider_usage_on_attempt() -> None:
+    provider = FakeProtocolDao(
+        streams=[
+            [
+                "hello",
+                ProviderStreamChunk(
+                    usage=Usage(input_tokens=7, output_tokens=11)
+                ),
+            ]
+        ]
+    )
+    service, traces, _, _ = build_service(chat_dao=provider)
+
+    _ = [event async for event in service.stream_events(request())]
+
+    trace = (await traces.list_traces())[0]
+    attempts = await traces.list_attempts(trace.request_id)
+    assert trace.input_tokens == 7
+    assert trace.output_tokens == 11
+    assert attempts[0].input_tokens == 7
+    assert attempts[0].output_tokens == 11
+    assert attempts[0].cost_usd > 0
+
+
+async def test_stream_does_not_reclassify_provider_success_when_audit_finalize_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = FakeProtocolDao(streams=[["answer"], ["backup"]])
+    service, traces, _, _ = build_service(
+        chat_dao=provider,
+        config=gateway_config(max_retries_per_model=0),
+    )
+    original_finish_attempt = traces.finish_attempt
+    finish_attempt_calls = 0
+
+    async def fail_first_finish_attempt(*args: Any, **kwargs: Any):
+        nonlocal finish_attempt_calls
+        finish_attempt_calls += 1
+        if finish_attempt_calls == 1:
+            raise RuntimeError("audit database unavailable")
+        return await original_finish_attempt(*args, **kwargs)
+
+    monkeypatch.setattr(traces, "finish_attempt", fail_first_finish_attempt)
+
+    with pytest.raises(GatewayError) as captured:
+        _ = [event async for event in service.stream_events(request())]
+
+    assert captured.value.code == "audit_persistence_failed"
+    assert provider.stream_models == ["deepseek-primary"]
+    trace = (await traces.list_traces())[0]
+    attempts = await traces.list_attempts(trace.request_id)
+    assert [item.status for item in attempts] == [AttemptStatus.RUNNING]
 
 
 async def test_first_stream_delta_reports_latency_from_initial_upstream_call(
@@ -640,7 +833,14 @@ async def test_stream_falls_back_before_first_delta() -> None:
         "deepseek-primary",
         "deepseek-backup",
     ]
-    assert traces.list_traces()[0].attempts == 3
+    trace = (await traces.list_traces())[0]
+    assert trace.attempts == 3
+    attempts = await traces.list_attempts(trace.request_id)
+    assert [item.attempt_type for item in attempts] == [
+        AttemptType.INITIAL,
+        AttemptType.RETRY,
+        AttemptType.FALLBACK,
+    ]
 
 
 async def test_stream_uses_configured_exponential_backoff_before_fallback(
@@ -784,7 +984,7 @@ async def test_stream_fails_after_first_delta_without_fallback() -> None:
         {"type": "response.failed", "error": "upstream_stream_failed"},
     ]
     assert chat_dao.stream_models == ["deepseek-primary"]
-    assert traces.list_traces()[0].status == "failed"
+    assert (await traces.list_traces())[0].status == "failed"
 
 
 def test_stream_events_rejects_protocol_mismatch_before_iteration() -> None:

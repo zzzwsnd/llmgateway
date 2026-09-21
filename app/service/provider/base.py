@@ -2,7 +2,7 @@ from collections.abc import AsyncIterator
 from typing import Protocol
 
 from app.model.config import ModelRouteConfig, ProviderConfig
-from app.model.dto import ProviderCompletion, ProviderRequest
+from app.model.dto import ProviderCompletion, ProviderRequest, ProviderStreamChunk
 from app.service.protocol_factory import ProtocolFactory
 
 
@@ -14,7 +14,7 @@ class ModelProvider(Protocol):
 
     def stream(
         self, model: ModelRouteConfig, request: ProviderRequest
-    ) -> AsyncIterator[str]:
+    ) -> AsyncIterator[ProviderStreamChunk]:
         raise NotImplementedError
 
 
@@ -32,5 +32,5 @@ class BaseModelProvider:
 
     def stream(
         self, model: ModelRouteConfig, request: ProviderRequest
-    ) -> AsyncIterator[str]:
+    ) -> AsyncIterator[ProviderStreamChunk]:
         return self._protocol_factory.get(model.protocol).stream(self._config, model, request)

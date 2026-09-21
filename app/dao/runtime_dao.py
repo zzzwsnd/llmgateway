@@ -19,14 +19,12 @@ class RuntimeDao:
         session_id: str,
         *,
         event_type: RuntimeEventType,
-        generation_id: str,
         connection_id: str | None = None,
     ) -> RuntimeEvent:
         return await self._mapper.append_event(
             session_id,
             RuntimeEvent(
                 type=event_type,
-                generation_id=generation_id,
                 connection_id=connection_id,
                 created_at=datetime.now(timezone.utc),
             ),
@@ -49,6 +47,34 @@ class RuntimeDao:
 
     async def has_events(self, session_id: str) -> bool:
         return await self._mapper.has_events(session_id)
+
+    async def has_public_events(
+        self,
+        session_id: str,
+        *,
+        after: str | None = None,
+    ) -> bool:
+        if not await self._mapper.has_events(session_id):
+            return False
+        cursor = after
+        public_types = {
+            RuntimeEventType.DELTA,
+            RuntimeEventType.COMPLETED,
+            RuntimeEventType.FAILED,
+            RuntimeEventType.CANCELLED,
+        }
+        while True:
+            events = await self._mapper.read_events(
+                session_id,
+                after=cursor,
+                block_milliseconds=0,
+                count=100,
+            )
+            if any(event.type in public_types for event in events):
+                return True
+            if len(events) < 100:
+                return False
+            cursor = events[-1].event_id
 
     async def latest_event_id(self, session_id: str) -> str | None:
         return await self._mapper.latest_event_id(session_id)
